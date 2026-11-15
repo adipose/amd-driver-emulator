@@ -1,6 +1,12 @@
 # Builds build\harness.exe with the VS 2022 x64 toolchain.
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
+
+# The DDI headers are Microsoft's and are not committed, so a fresh checkout has none. Fetch them here rather
+# than making every caller remember to: a clone of this repository should build with one command.
+if (-not (Test-Path (Join-Path $root 'third_party\wdk-include\d3d10umddi.h'))) {
+    & (Join-Path $root 'tools\Fetch-WdkHeaders.ps1')
+}
 $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -version '[17.0,18.0)' -products * -latest -property installationPath
 if (-not $vs) { throw 'Visual Studio 2022 not found' }
 $out = Join-Path $root 'build'

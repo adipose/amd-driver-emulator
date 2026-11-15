@@ -46,8 +46,7 @@ headers come from Microsoft's `Microsoft.Windows.WDK.x64` NuGet package, and
 neither they nor the driver binaries under test are redistributed here (see
 `NOTICE` and `drivers\README.md`).
 
-    .\tools\Fetch-WdkHeaders.ps1   # first time: the DDI headers from nuget.org
-    .\build.ps1
+    .\build.ps1   # fetches the DDI headers from nuget.org on a fresh checkout, then builds
 
 builds four binaries into `build\`: `legacy9.exe`, `legacy9hook.dll` (the same
 probe, to run inside another process), `inject.exe` (loads the hook into a
