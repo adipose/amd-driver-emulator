@@ -1,0 +1,12 @@
+build/
+results/
+*.log
+
+# The legacy AMD driver binaries are not redistributed here. See drivers\README.md.
+drivers/*
+!drivers/README.md
+
+# The WDK DDI headers are Microsoft's and are not redistributed here: tools\Fetch-WdkHeaders.ps1 gets them from
+# nuget.org, and the package is a 106 MB download cache.
+third_party/wdk-include/
+third_party/wdk-nupkg/

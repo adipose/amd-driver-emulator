@@ -1,0 +1,19 @@
+This repository is released under the MIT License (see LICENSE). Two kinds of
+file it depends on are not part of it and are not redistributed here:
+
+  third_party/wdk-include/
+        the WDK display-driver DDI headers (d3dumddi.h, d3d10umddi.h,
+        d3d12umddi.h, d3dkmddi.h, umdprovider.h and the tokenized program
+        format headers), Copyright (c) Microsoft Corporation.
+        tools/Fetch-WdkHeaders.ps1 fetches them from nuget.org under
+        Microsoft's licences, the same arrangement the sibling device
+        repositories use for the SDK and WDK. The directory is gitignored.
+
+  drivers/
+        the graphics driver binaries under test, which belong to their
+        vendor. Nothing in that directory is committed; drivers/README.md
+        says what goes there and where it comes from. The harness loads them
+        as libraries and installs nothing.
+
+Everything else -- src, tools, build.ps1 -- is original to this repository and
+is MIT-licensed.
