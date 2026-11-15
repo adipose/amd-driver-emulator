@@ -441,10 +441,14 @@ static void ScanHeapsForSignature(const char* when)
         if (reported.count(b.first)) continue;
         reported[b.first] = true;
         char w[300];
+        // The displacement is from the vector-shaped block's start to the damaged bytes at its +0x64, measured
+        // in the driver block's frame: 0x64 - (victim - driver). Printed in hex, which is how the offsets in
+        // this investigation are written.
+        long long disp = 0x64 - nearest;
         Log("    adjacency: driver block %p (from %s) is %+lld bytes (%+.2f strides) from vector-shaped block %p;"
-            " a write %+lld from that block's start would land on the damaged bytes",
+            " a write at %s0x%llx from the driver block's start would land on that block's damaged bytes",
             b.first, Where(b.second, w, sizeof w), nearest, (double)nearest / (double)g_stride, at,
-            0x64 - nearest);
+            disp < 0 ? "-" : "+", (unsigned long long)(disp < 0 ? -disp : disp));
     }
 
     g_lastNearby = nearby;
