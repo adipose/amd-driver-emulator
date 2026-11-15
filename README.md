@@ -37,7 +37,47 @@ On Windows 10 22H2 (19045) with an AMD Radeon 780M, 2026-11-15:
 | Guard zones on every driver allocation, checked at each free | yes, 1470 checks |
 | Detect a planted heap-damage pattern in a live heap walk | yes |
 | Host the current D3D11 UMD (`amdxx64.dll`) through `CreateDevice` and render | yes, clear and read back |
-| Drive the legacy driver past `CreateDevice` | not yet |
+| Drive the legacy driver into `CreateDevice` with a faked kernel | yes, 35 kernel callbacks deep |
+| Get the legacy driver's `CreateDevice` to succeed | no, see below |
+
+## Where the legacy device phase stops
+
+`--device` runs `CreateDevice` with the kernel side faked: allocations backed
+by guarded virtual memory, invented GPU virtual addresses, paging queues,
+and submissions accepted and reported complete. The driver gets a long way in
+and then gives up, and what it needs next is a plausible description of
+hardware nobody here has.
+
+What the probe established about how it decides:
+
+- **Bit 7 of the adapter record's flags at `+0x1F4` chooses the memory
+  model.** Clear, and the driver uses the WDDM 1.x path (`RenderCb`, command
+  buffers from the runtime) and fails in its context setup at
+  `atiumd64+0x58A90`. Set, and it uses the WDDM 2 path: paging queues, GPU
+  virtual addresses, residency, `SubmitCommand`. The WDDM 2 path gets further,
+  so that is the default the scripts pass.
+- **Bit 10 (`0x400`)** makes it ask for a second, 14848-byte adapter record
+  into `adapter+0x280`, which is where its hardware description lives.
+- **The record's checksum at `+0xC` is only verified when non-zero**, so
+  fields can be invented freely as long as that dword is left at zero. It is a
+  XOR-and-add over the 152 dwords of the record.
+- **Invented GPU virtual addresses have to be low.** With a base of `0x10000`
+  the driver accepts them and proceeds to build PM4 command packets; at
+  `0x100000` and above it refuses with `E_OUTOFMEMORY`. The limit it believes
+  in comes from the record.
+- **What is left is the record's contents.** With it near-empty the driver
+  reaches a "reserve space in the command buffer" call that returns null and
+  faults writing a packet header to address 0 (`atiumd64+0x5447BF`). Filling
+  the record with a small non-zero pattern takes it further still (35
+  callbacks, four paging queues) but it then refuses cleanly. Each remaining
+  field has to be found by tracing the code that reads it.
+
+Two things worth keeping in mind about that work. A clean run under an
+invented record proves very little, because the driver is taking the paths
+that record selects. But a write outside its own allocation, which the guard
+zones catch, is wrong on any hardware and would be worth having whatever the
+record said. The evidence this harness can produce is asymmetric, and only one
+side of it is worth chasing.
 
 ## What it needs
 

@@ -689,6 +689,645 @@ static HRESULT APIENTRY CALLBACK GetMultisampleMethodListCb(HANDLE hAdapter, D3D
     return S_OK;
 }
 
+// ---------------------------------------------------- the fake kernel, device level
+//
+// Past OpenAdapter the driver stops asking questions and starts allocating memory, creating contexts and
+// submitting command buffers. None of that can be forwarded: the kernel driver on this machine is bound to
+// different hardware. So it is answered instead -- handles are invented, allocations are backed by ordinary
+// virtual memory, and submissions are accepted and reported complete.
+//
+// Every buffer handed to the driver is followed by an inaccessible page, so a write past the end of a locked
+// allocation or a command buffer faults at the instruction that made it rather than corrupting the harness.
+
+struct FakeAlloc {
+    D3DKMT_HANDLE handle;
+    SIZE_T size;        // what was handed out, excluding the guard page
+    void* mem;
+    ULONGLONG gpuVa;
+};
+static std::map<D3DKMT_HANDLE, FakeAlloc> g_fakeAllocs;
+static D3DKMT_HANDLE g_nextKmHandle = 0x00300000;
+
+// Where the invented GPU virtual addresses start, and the granularity they are handed out at. A driver for
+// hardware of this age may believe its address space is small, and an address beyond what it thinks it has is
+// a plausible reason for it to refuse. --gpu-va-base moves it; 64 KB is the usual GPU page granularity.
+static ULONGLONG g_gpuVaBase = 0x0000000000100000ull;
+static ULONGLONG g_gpuVaNext = 0;
+static ULONGLONG g_gpuVaGrain = 0x10000;
+
+static ULONGLONG NextGpuVa(ULONGLONG size)
+{
+    if (!g_gpuVaNext) g_gpuVaNext = g_gpuVaBase;
+    ULONGLONG va = (g_gpuVaNext + g_gpuVaGrain - 1) & ~(g_gpuVaGrain - 1);
+    if (!size) size = g_gpuVaGrain;
+    g_gpuVaNext = va + ((size + g_gpuVaGrain - 1) & ~(g_gpuVaGrain - 1));
+    return va;
+}
+static SIZE_T g_lockSize = 32u << 20; // what an allocation is backed with when the driver locks it
+static bool g_escapeZero = false;     // --escape-zero: answer an escape with zeros instead of leaving it alone
+static size_t g_guardFaults = 0;
+
+// Virtual memory with an inaccessible page after it, so an overrun faults instead of spreading.
+static void* GuardedAlloc(SIZE_T size, SIZE_T* outTotal = nullptr)
+{
+    SIZE_T page = 0x1000;
+    SIZE_T usable = (size + page - 1) & ~(page - 1);
+    BYTE* base = (BYTE*)VirtualAlloc(nullptr, usable + page, MEM_RESERVE, PAGE_NOACCESS);
+    if (!base) return nullptr;
+    if (!VirtualAlloc(base, usable, MEM_COMMIT, PAGE_READWRITE)) { VirtualFree(base, 0, MEM_RELEASE); return nullptr; }
+    if (outTotal) *outTotal = usable;
+    return base;
+}
+
+struct FakeContext {
+    HANDLE handle;
+    void* cmd;
+    UINT cmdSize;
+    D3DDDI_ALLOCATIONLIST* allocList;
+    UINT allocListSize;
+    D3DDDI_PATCHLOCATIONLIST* patchList;
+    UINT patchListSize;
+    ULONGLONG cmdGpuVa;
+};
+static std::map<HANDLE, FakeContext> g_fakeContexts;
+static UINT_PTR g_nextContext = 0xC0000;
+static size_t g_submits = 0;
+
+static bool SizeContext(FakeContext* c, UINT cmdSize, UINT allocCount, UINT patchCount)
+{
+    if (cmdSize < 0x10000) cmdSize = 0x100000;
+    if (allocCount < 256) allocCount = 4096;
+    if (patchCount < 256) patchCount = 4096;
+    c->cmd = GuardedAlloc(cmdSize);
+    c->allocList = (D3DDDI_ALLOCATIONLIST*)GuardedAlloc(allocCount * sizeof(D3DDDI_ALLOCATIONLIST));
+    c->patchList = (D3DDDI_PATCHLOCATIONLIST*)GuardedAlloc(patchCount * sizeof(D3DDDI_PATCHLOCATIONLIST));
+    if (!c->cmd || !c->allocList || !c->patchList) return false;
+    c->cmdSize = cmdSize;
+    c->allocListSize = allocCount;
+    c->patchListSize = patchCount;
+    c->cmdGpuVa = NextGpuVa(cmdSize);
+    return true;
+}
+
+// Each table slot gets its own stub, so a callback the driver needs and the harness has not implemented is
+// named by slot and offset instead of crashing on a null pointer.
+static const size_t DEV_CB_SLOTS = sizeof(D3DDDI_DEVICECALLBACKS) / sizeof(void*);
+static size_t g_devStubHits = 0;
+
+template <int N>
+static HRESULT APIENTRY DevStub(void* a, void* b, void* c, void* d)
+{
+    (void)a; (void)b; (void)c; (void)d;
+    g_devStubHits++;
+    Log("  cb device slot %d (offset 0x%zx) [stub] = E_NOTIMPL", N, (size_t)N * sizeof(void*));
+    LogStack("stub");
+    return E_NOTIMPL;
+}
+
+template <size_t... I>
+static void FillDevStubs(void** table, std::index_sequence<I...>)
+{
+    ((table[I] = (void*)&DevStub<(int)I>), ...);
+}
+
+static HRESULT APIENTRY CALLBACK DevAllocateCb(HANDLE hDevice, D3DDDICB_ALLOCATE* p)
+{
+    (void)hDevice;
+    p->hKMResource = ++g_nextKmHandle;
+    for (UINT i = 0; i < p->NumAllocations; i++) {
+        D3DDDI_ALLOCATIONINFO* a = &p->pAllocationInfo[i];
+        FakeAlloc f{};
+        f.handle = ++g_nextKmHandle;
+        f.size = 0;
+        f.mem = nullptr;
+        f.gpuVa = NextGpuVa(g_lockSize);
+        g_fakeAllocs[f.handle] = f;
+        a->hAllocation = f.handle;
+    }
+    Log("  cb AllocateCb(hResource=%p, %u allocations, %u bytes private) = S_OK, hKMResource=%x", p->hResource,
+        p->NumAllocations, p->PrivateDriverDataSize, p->hKMResource);
+    if (p->pPrivateDriverData && p->PrivateDriverDataSize)
+        HexDump("    res", p->pPrivateDriverData, p->PrivateDriverDataSize, 48);
+    for (UINT i = 0; i < p->NumAllocations; i++) {
+        D3DDDI_ALLOCATIONINFO* a = &p->pAllocationInfo[i];
+        Log("    allocation %u: handle=%x pSystemMem=%p flags=%08x, %u bytes of private data", i, a->hAllocation,
+            a->pSystemMem, a->Flags.Value, a->PrivateDriverDataSize);
+        if (a->pPrivateDriverData && a->PrivateDriverDataSize)
+            HexDump("    alloc", a->pPrivateDriverData, a->PrivateDriverDataSize, 64);
+    }
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevDeallocateCb(HANDLE hDevice, CONST D3DDDICB_DEALLOCATE* p)
+{
+    (void)hDevice;
+    for (UINT i = 0; i < p->NumAllocations && p->HandleList; i++) {
+        auto it = g_fakeAllocs.find(p->HandleList[i]);
+        if (it == g_fakeAllocs.end()) continue;
+        if (it->second.mem) VirtualFree(it->second.mem, 0, MEM_RELEASE);
+        g_fakeAllocs.erase(it);
+    }
+    Log("  cb DeallocateCb(hResource=%p, %u allocations) = S_OK", p->hResource, p->NumAllocations);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevLockCb(HANDLE hDevice, D3DDDICB_LOCK* p)
+{
+    (void)hDevice;
+    auto it = g_fakeAllocs.find(p->hAllocation);
+    if (it == g_fakeAllocs.end()) {
+        Log("  cb LockCb(hAllocation=%x) = E_INVALIDARG, no such allocation", p->hAllocation);
+        return E_INVALIDARG;
+    }
+    FakeAlloc& f = it->second;
+    if (!f.mem) {
+        // The size the driver meant is in its own private data, which only it understands, so the allocation is
+        // backed generously and the guard page catches a driver that wants more than this.
+        SIZE_T want = p->NumPages ? (SIZE_T)p->NumPages * 0x1000 : g_lockSize;
+        if (want < g_lockSize) want = g_lockSize;
+        f.mem = GuardedAlloc(want, &f.size);
+        if (!f.mem) { Log("  cb LockCb: out of memory backing %zu bytes", want); return E_OUTOFMEMORY; }
+    }
+    p->pData = f.mem;
+    p->GpuVirtualAddress = f.gpuVa;
+    Log("  cb LockCb(hAllocation=%x, pages=%u, flags=%08x) = S_OK, %zu bytes at %p, gpuVa %llx", p->hAllocation,
+        p->NumPages, p->Flags.Value, f.size, f.mem, f.gpuVa);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevUnlockCb(HANDLE hDevice, CONST D3DDDICB_UNLOCK* p)
+{
+    (void)hDevice;
+    Log("  cb UnlockCb(%u allocations) = S_OK", p->NumAllocations);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevEscapeCb(HANDLE hAdapterOrDevice, CONST D3DDDICB_ESCAPE* p)
+{
+    (void)hAdapterOrDevice;
+    // The payload is an AMD-private request with its own 0x80-byte header (size, version, opcode) and is
+    // answered in place. Zeroing it destroys the header the driver is about to re-read, so the buffer is left
+    // exactly as the driver filled it: anything the driver validates about its own request still holds, and the
+    // reply body reads as whatever it initialised. --escape-zero asks for the old behaviour instead.
+    Log("  cb EscapeCb(hDevice=%p, hContext=%p, %u bytes, flags=%08x, opcode=%08x) = S_OK%s", p->hDevice,
+        p->hContext, p->PrivateDriverDataSize, p->Flags.Value,
+        p->PrivateDriverDataSize >= 12 ? ((const UINT*)p->pPrivateDriverData)[2] : 0,
+        g_escapeZero ? ", answered with zeros" : ", left as the driver filled it");
+    if (p->pPrivateDriverData && p->PrivateDriverDataSize) {
+        HexDump("esc", p->pPrivateDriverData, p->PrivateDriverDataSize, 32);
+        if (g_escapeZero) memset(p->pPrivateDriverData, 0, p->PrivateDriverDataSize);
+    }
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevCreateContextCb(HANDLE hDevice, D3DDDICB_CREATECONTEXT* p)
+{
+    (void)hDevice;
+    FakeContext c{};
+    c.handle = (HANDLE)++g_nextContext;
+    if (!SizeContext(&c, 0, 0, 0)) return E_OUTOFMEMORY;
+    g_fakeContexts[c.handle] = c;
+    p->hContext = c.handle;
+    p->pCommandBuffer = c.cmd;
+    p->CommandBufferSize = c.cmdSize;
+    p->pAllocationList = c.allocList;
+    p->AllocationListSize = c.allocListSize;
+    p->pPatchLocationList = c.patchList;
+    p->PatchLocationListSize = c.patchListSize;
+    p->CommandBuffer = c.cmdGpuVa;
+    Log("  cb CreateContextCb(node=%u, affinity=%u, %u bytes private) = S_OK, hContext=%p, command buffer %u bytes"
+        " at %p",
+        p->NodeOrdinal, p->EngineAffinity, p->PrivateDriverDataSize, c.handle, c.cmdSize, c.cmd);
+    LogStack("CreateContextCb", 1, 8);
+    if (p->pPrivateDriverData && p->PrivateDriverDataSize) HexDump("ctx", p->pPrivateDriverData, p->PrivateDriverDataSize, 64);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevDestroyContextCb(HANDLE hDevice, CONST D3DDDICB_DESTROYCONTEXT* p)
+{
+    (void)hDevice;
+    auto it = g_fakeContexts.find(p->hContext);
+    if (it != g_fakeContexts.end()) {
+        if (it->second.cmd) VirtualFree(it->second.cmd, 0, MEM_RELEASE);
+        if (it->second.allocList) VirtualFree(it->second.allocList, 0, MEM_RELEASE);
+        if (it->second.patchList) VirtualFree(it->second.patchList, 0, MEM_RELEASE);
+        g_fakeContexts.erase(it);
+    }
+    Log("  cb DestroyContextCb(hContext=%p) = S_OK", p->hContext);
+    return S_OK;
+}
+
+// The submission itself: the command buffer is accepted, nothing executes it, and the driver is given a buffer
+// to carry on writing into.
+static HRESULT APIENTRY CALLBACK DevRenderCb(HANDLE hDevice, D3DDDICB_RENDER* p)
+{
+    (void)hDevice;
+    g_submits++;
+    auto it = g_fakeContexts.find(p->hContext);
+    if (it == g_fakeContexts.end()) {
+        Log("  cb RenderCb(hContext=%p) = E_INVALIDARG, no such context", p->hContext);
+        return E_INVALIDARG;
+    }
+    FakeContext& c = it->second;
+    if (p->Flags.ResizeCommandBuffer || p->Flags.ResizeAllocationList || p->Flags.ResizePatchLocationList) {
+        FakeContext n{};
+        n.handle = c.handle;
+        if (!SizeContext(&n, p->NewCommandBufferSize, p->NewAllocationListSize, p->NewPatchLocationListSize))
+            return E_OUTOFMEMORY;
+        if (c.cmd) VirtualFree(c.cmd, 0, MEM_RELEASE);
+        if (c.allocList) VirtualFree(c.allocList, 0, MEM_RELEASE);
+        if (c.patchList) VirtualFree(c.patchList, 0, MEM_RELEASE);
+        c = n;
+        Log("  cb RenderCb: resized to command buffer %u, allocation list %u, patch list %u", c.cmdSize,
+            c.allocListSize, c.patchListSize);
+    }
+    p->pNewCommandBuffer = c.cmd;
+    p->NewCommandBufferSize = c.cmdSize;
+    p->pNewAllocationList = c.allocList;
+    p->NewAllocationListSize = c.allocListSize;
+    p->pNewPatchLocationList = c.patchList;
+    p->NewPatchLocationListSize = c.patchListSize;
+    p->NewCommandBuffer = c.cmdGpuVa;
+    p->QueuedBufferCount = 0; // nothing is queued: the submission is reported already complete
+    Log("  cb RenderCb(hContext=%p, %u bytes at offset %u, %u allocations, %u patches) = S_OK", p->hContext,
+        p->CommandLength, p->CommandOffset, p->NumAllocations, p->NumPatchLocations);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevPresentCb(HANDLE hDevice, D3DDDICB_PRESENT* p)
+{
+    (void)hDevice;
+    Log("  cb PresentCb(src=%x, dst=%x, hContext=%p) = S_OK", p->hSrcAllocation, p->hDstAllocation, p->hContext);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevCreateSyncCb(HANDLE hDevice, D3DDDICB_CREATESYNCHRONIZATIONOBJECT* p)
+{
+    (void)hDevice;
+    p->hSyncObject = ++g_nextKmHandle;
+    Log("  cb CreateSynchronizationObjectCb(type=%u) = S_OK, handle=%x", (UINT)p->Info.Type, p->hSyncObject);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevDestroySyncCb(HANDLE hDevice, CONST D3DDDICB_DESTROYSYNCHRONIZATIONOBJECT* p)
+{
+    (void)hDevice;
+    Log("  cb DestroySynchronizationObjectCb(%x) = S_OK", p->hSyncObject);
+    return S_OK;
+}
+
+// Waits return at once and signals are accepted: with nothing executing, every fence is already past.
+static HRESULT APIENTRY CALLBACK DevWaitSyncCb(HANDLE hDevice, CONST D3DDDICB_WAITFORSYNCHRONIZATIONOBJECT* p)
+{
+    (void)hDevice;
+    Log("  cb WaitForSynchronizationObjectCb(%u objects) = S_OK, returned at once", p->ObjectCount);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevSignalSyncCb(HANDLE hDevice, CONST D3DDDICB_SIGNALSYNCHRONIZATIONOBJECT* p)
+{
+    (void)hDevice;
+    Log("  cb SignalSynchronizationObjectCb(%u objects) = S_OK", p->ObjectCount);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevQueryResidencyCb(HANDLE hDevice, CONST D3DDDICB_QUERYRESIDENCY* p)
+{
+    (void)hDevice;
+    for (UINT i = 0; i < p->NumAllocations && p->pResidencyStatus; i++)
+        p->pResidencyStatus[i] = D3DDDI_RESIDENCYSTATUS_RESIDENTINGPUMEMORY;
+    Log("  cb QueryResidencyCb(%u allocations) = S_OK, all resident", p->NumAllocations);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevSetPriorityCb(HANDLE hDevice, D3DDDICB_SETPRIORITY* p)
+{
+    (void)hDevice;
+    Log("  cb SetPriorityCb(%u allocations) = S_OK", p->NumAllocations);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevSetAsyncCallbacksCb(HANDLE hDevice, BOOL enable)
+{
+    (void)hDevice;
+    Log("  cb SetAsyncCallbacksCb(%s) = S_OK", enable ? "enable" : "disable");
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevSetDisplayModeCb(HANDLE hDevice, D3DDDICB_SETDISPLAYMODE* p)
+{
+    (void)hDevice;
+    Log("  cb SetDisplayModeCb(primary=%x) = S_OK", p->hPrimaryAllocation);
+    return S_OK;
+}
+
+// ---- the WDDM 2 memory model ------------------------------------------------------------------------------
+//
+// Bit 7 of the adapter record's flags at +0x1F4 switches the driver onto this path: paging queues, GPU virtual
+// addresses, residency and SubmitCommand instead of RenderCb. Nothing executes, so every fence is reported
+// already past: the fence words the driver polls are held at a value no wait can exceed, and every paging
+// operation returns a fence value of 0, meaning there is nothing to wait for.
+
+static UINT64* g_fenceWords = nullptr; // a page of fence values handed out to paging queues and sync objects
+static size_t g_fenceNext = 0;
+static size_t g_pagingQueues = 0;
+
+static UINT64* NextFenceWord()
+{
+    if (!g_fenceWords) {
+        g_fenceWords = (UINT64*)GuardedAlloc(0x1000);
+        if (!g_fenceWords) return nullptr;
+    }
+    if (g_fenceNext >= 0x1000 / sizeof(UINT64)) g_fenceNext = 0;
+    UINT64* w = &g_fenceWords[g_fenceNext++];
+    *w = 0x7FFFFFFFFFFFFFFFull; // already past anything the driver can wait for
+    return w;
+}
+
+static HRESULT APIENTRY CALLBACK DevCreatePagingQueueCb(HANDLE hDevice, D3DDDICB_CREATEPAGINGQUEUE* p)
+{
+    (void)hDevice;
+    UINT64* fence = NextFenceWord();
+    if (!fence) return E_OUTOFMEMORY;
+    p->hPagingQueue = ++g_nextKmHandle;
+    p->hSyncObject = ++g_nextKmHandle;
+    p->FenceValueCPUVirtualAddress = fence;
+    g_pagingQueues++;
+    Log("  cb CreatePagingQueueCb(priority=%d, adapter=%u) = S_OK, queue=%x, fence word at %p", (int)p->Priority,
+        p->PhysicalAdapterIndex, p->hPagingQueue, fence);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevDestroyPagingQueueCb(HANDLE hDevice, CONST D3DDDI_DESTROYPAGINGQUEUE* p)
+{
+    (void)hDevice;
+    Log("  cb DestroyPagingQueueCb(%x) = S_OK", p->hPagingQueue);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevMakeResidentCb(HANDLE hDevice, D3DDDI_MAKERESIDENT* p)
+{
+    (void)hDevice;
+    p->PagingFenceValue = 0;
+    p->NumBytesToTrim = 0;
+    Log("  cb MakeResidentCb(queue=%x, %u allocations) = S_OK, nothing to wait for", p->hPagingQueue,
+        p->NumAllocations);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevEvictCb(HANDLE hDevice, D3DDDICB_EVICT* p)
+{
+    (void)hDevice;
+    p->NumBytesToTrim = 0;
+    Log("  cb EvictCb(%u allocations) = S_OK", p->NumAllocations);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevReserveGpuVaCb(HANDLE hDevice, D3DDDI_RESERVEGPUVIRTUALADDRESS* p)
+{
+    (void)hDevice;
+    ULONGLONG size = p->Size ? p->Size : 0x1000;
+    p->VirtualAddress = NextGpuVa(size);
+    p->PagingFenceValue = 0;
+    Log("  cb ReserveGpuVirtualAddressCb(size=%llx) = S_OK, va=%llx", size, p->VirtualAddress);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevMapGpuVaCb(HANDLE hDevice, D3DDDI_MAPGPUVIRTUALADDRESS* p)
+{
+    (void)hDevice;
+    ULONGLONG va = p->BaseAddress;
+    if (!va) {
+        auto it = g_fakeAllocs.find(p->hAllocation);
+        va = it != g_fakeAllocs.end() ? it->second.gpuVa : NextGpuVa(p->SizeInPages * 0x1000);
+    }
+    // The driver may constrain where the mapping may land. A virtual address outside what it asked for is a
+    // plausible reason for it to give up, so the request is honoured when it names a range.
+    if (!p->BaseAddress && (p->MinimumAddress || p->MaximumAddress)) {
+        ULONGLONG lo = p->MinimumAddress ? p->MinimumAddress : va;
+        ULONGLONG hi = p->MaximumAddress ? p->MaximumAddress : (ULONGLONG)-1;
+        ULONGLONG want = (lo + 0xFFFFF) & ~0xFFFFFull;
+        ULONGLONG size = p->SizeInPages * 0x1000;
+        if (want + size <= hi) va = want;
+    }
+    p->VirtualAddress = va;
+    p->PagingFenceValue = 0;
+    Log("  cb MapGpuVirtualAddressCb(allocation=%x, base=%llx, min=%llx, max=%llx, offset=%llx, pages=%llx,"
+        " protection=%llx) = S_OK, va=%llx",
+        p->hAllocation, (unsigned long long)p->BaseAddress, (unsigned long long)p->MinimumAddress,
+        (unsigned long long)p->MaximumAddress, (unsigned long long)p->OffsetInPages,
+        (unsigned long long)p->SizeInPages, (unsigned long long)p->DriverProtection, va);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevFreeGpuVaCb(HANDLE hDevice, CONST D3DDDICB_FREEGPUVIRTUALADDRESS* p)
+{
+    (void)hDevice;
+    Log("  cb FreeGpuVirtualAddressCb(base=%llx, size=%llx) = S_OK", (unsigned long long)p->BaseAddress,
+        (unsigned long long)p->Size);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevUpdateGpuVaCb(HANDLE hDevice, CONST D3DDDICB_UPDATEGPUVIRTUALADDRESS* p)
+{
+    (void)hDevice;
+    Log("  cb UpdateGpuVirtualAddressCb(%u operations) = S_OK", p->NumOperations);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevLock2Cb(HANDLE hDevice, D3DDDICB_LOCK2* p)
+{
+    (void)hDevice;
+    auto it = g_fakeAllocs.find(p->hAllocation);
+    if (it == g_fakeAllocs.end()) {
+        Log("  cb Lock2Cb(%x) = E_INVALIDARG, no such allocation", p->hAllocation);
+        return E_INVALIDARG;
+    }
+    FakeAlloc& f = it->second;
+    if (!f.mem) {
+        f.mem = GuardedAlloc(g_lockSize, &f.size);
+        if (!f.mem) return E_OUTOFMEMORY;
+    }
+    p->pData = f.mem;
+    Log("  cb Lock2Cb(%x, flags=%08x) = S_OK, %zu bytes at %p", p->hAllocation, p->Flags.Value, f.size, f.mem);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevUnlock2Cb(HANDLE hDevice, CONST D3DDDICB_UNLOCK2* p)
+{
+    (void)hDevice;
+    Log("  cb Unlock2Cb(%x) = S_OK", p->hAllocation);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevInvalidateCacheCb(HANDLE hDevice, CONST D3DDDICB_INVALIDATECACHE* p)
+{
+    (void)hDevice;
+    Log("  cb InvalidateCacheCb(%x) = S_OK", p->hAllocation);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevCreateContextVirtualCb(HANDLE hDevice, D3DDDICB_CREATECONTEXTVIRTUAL* p)
+{
+    (void)hDevice;
+    // In this model the driver writes its own command buffers into allocations it owns, so no buffers are
+    // handed back here; only the handle.
+    FakeContext c{};
+    c.handle = (HANDLE)++g_nextContext;
+    g_fakeContexts[c.handle] = c;
+    p->hContext = c.handle;
+    Log("  cb CreateContextVirtualCb(node=%u, affinity=%u, %u bytes private) = S_OK, hContext=%p", p->NodeOrdinal,
+        p->EngineAffinity, p->PrivateDriverDataSize, c.handle);
+    if (p->pPrivateDriverData && p->PrivateDriverDataSize) HexDump("ctx", p->pPrivateDriverData, p->PrivateDriverDataSize, 48);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevSubmitCommandCb(HANDLE hDevice, CONST D3DDDICB_SUBMITCOMMAND* p)
+{
+    (void)hDevice;
+    g_submits++;
+    Log("  cb SubmitCommandCb(commands at %llx, %u bytes, %u broadcast contexts) = S_OK, reported complete",
+        (unsigned long long)p->Commands, p->CommandLength, p->BroadcastContextCount);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevCreateSync2Cb(HANDLE hDevice, D3DDDICB_CREATESYNCHRONIZATIONOBJECT2* p)
+{
+    (void)hDevice;
+    p->hSyncObject = ++g_nextKmHandle;
+    if (p->Info.Type == D3DDDI_MONITORED_FENCE) {
+        UINT64* fence = NextFenceWord();
+        if (!fence) return E_OUTOFMEMORY;
+        *fence = p->Info.MonitoredFence.InitialFenceValue;
+        p->Info.MonitoredFence.FenceValueCPUVirtualAddress = fence;
+        p->Info.MonitoredFence.FenceValueGPUVirtualAddress = NextGpuVa(0x1000);
+    }
+    Log("  cb CreateSynchronizationObject2Cb(type=%d) = S_OK, handle=%x", (int)p->Info.Type, p->hSyncObject);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevWaitSyncFromCpuCb(HANDLE hDevice,
+                                                      CONST D3DDDICB_WAITFORSYNCHRONIZATIONOBJECTFROMCPU* p)
+{
+    (void)hDevice;
+    Log("  cb WaitForSynchronizationObjectFromCpuCb(%u objects) = S_OK, returned at once", p->ObjectCount);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevSignalSyncFromCpuCb(HANDLE hDevice,
+                                                        CONST D3DDDICB_SIGNALSYNCHRONIZATIONOBJECTFROMCPU* p)
+{
+    (void)hDevice;
+    // The fence the driver is signalling is held past every value it can ask about, so nothing has to move.
+    Log("  cb SignalSynchronizationObjectFromCpuCb(%u objects) = S_OK", p->ObjectCount);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevWaitSyncFromGpuCb(HANDLE hDevice,
+                                                      CONST D3DDDICB_WAITFORSYNCHRONIZATIONOBJECTFROMGPU* p)
+{
+    (void)hDevice;
+    Log("  cb WaitForSynchronizationObjectFromGpuCb(%u objects) = S_OK", p->ObjectCount);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevSignalSyncFromGpuCb(HANDLE hDevice,
+                                                        CONST D3DDDICB_SIGNALSYNCHRONIZATIONOBJECTFROMGPU* p)
+{
+    (void)hDevice;
+    Log("  cb SignalSynchronizationObjectFromGpuCb(%u objects) = S_OK", p->ObjectCount);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevSignalSyncFromGpu2Cb(HANDLE hDevice,
+                                                         CONST D3DDDICB_SIGNALSYNCHRONIZATIONOBJECTFROMGPU2* p)
+{
+    (void)hDevice;
+    Log("  cb SignalSynchronizationObjectFromGpu2Cb(%u objects) = S_OK", p->ObjectCount);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevDeallocate2Cb(HANDLE hDevice, CONST D3DDDICB_DEALLOCATE2* p)
+{
+    (void)hDevice;
+    for (UINT i = 0; i < p->NumAllocations && p->HandleList; i++) {
+        auto it = g_fakeAllocs.find(p->HandleList[i]);
+        if (it == g_fakeAllocs.end()) continue;
+        if (it->second.mem) VirtualFree(it->second.mem, 0, MEM_RELEASE);
+        g_fakeAllocs.erase(it);
+    }
+    Log("  cb Deallocate2Cb(%u allocations) = S_OK", p->NumAllocations);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevOfferAllocationsCb(HANDLE hDevice, CONST D3DDDICB_OFFERALLOCATIONS* p)
+{
+    (void)hDevice;
+    Log("  cb OfferAllocationsCb(%u allocations) = S_OK", p->NumAllocations);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevReclaimAllocationsCb(HANDLE hDevice, CONST D3DDDICB_RECLAIMALLOCATIONS* p)
+{
+    (void)hDevice;
+    for (UINT i = 0; i < p->NumAllocations && p->pDiscarded; i++) p->pDiscarded[i] = FALSE;
+    Log("  cb ReclaimAllocationsCb(%u allocations) = S_OK, none discarded", p->NumAllocations);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevLogUMDMarkerCb(HANDLE hDevice, CONST D3DDDICB_LOGUMDMARKER* p)
+{
+    (void)hDevice; (void)p;
+    return S_OK;
+}
+
+static void FillDeviceCallbacks(D3DDDI_DEVICECALLBACKS* cb)
+{
+    FillDevStubs<>((void**)cb, std::make_index_sequence<DEV_CB_SLOTS>{});
+    cb->pfnAllocateCb = DevAllocateCb;
+    cb->pfnDeallocateCb = DevDeallocateCb;
+    cb->pfnLockCb = DevLockCb;
+    cb->pfnUnlockCb = DevUnlockCb;
+    cb->pfnEscapeCb = DevEscapeCb;
+    cb->pfnCreateContextCb = DevCreateContextCb;
+    cb->pfnDestroyContextCb = DevDestroyContextCb;
+    cb->pfnRenderCb = DevRenderCb;
+    cb->pfnPresentCb = DevPresentCb;
+    cb->pfnCreateSynchronizationObjectCb = DevCreateSyncCb;
+    cb->pfnDestroySynchronizationObjectCb = DevDestroySyncCb;
+    cb->pfnWaitForSynchronizationObjectCb = DevWaitSyncCb;
+    cb->pfnSignalSynchronizationObjectCb = DevSignalSyncCb;
+    cb->pfnQueryResidencyCb = DevQueryResidencyCb;
+    cb->pfnSetPriorityCb = DevSetPriorityCb;
+    cb->pfnSetAsyncCallbacksCb = DevSetAsyncCallbacksCb;
+    cb->pfnSetDisplayModeCb = DevSetDisplayModeCb;
+
+    // The WDDM 2 half, which the driver uses when the adapter record asks for it.
+    cb->pfnCreatePagingQueueCb = DevCreatePagingQueueCb;
+    cb->pfnDestroyPagingQueueCb = DevDestroyPagingQueueCb;
+    cb->pfnMakeResidentCb = DevMakeResidentCb;
+    cb->pfnEvictCb = DevEvictCb;
+    cb->pfnReserveGpuVirtualAddressCb = DevReserveGpuVaCb;
+    cb->pfnMapGpuVirtualAddressCb = DevMapGpuVaCb;
+    cb->pfnFreeGpuVirtualAddressCb = DevFreeGpuVaCb;
+    cb->pfnUpdateGpuVirtualAddressCb = DevUpdateGpuVaCb;
+    cb->pfnLock2Cb = DevLock2Cb;
+    cb->pfnUnlock2Cb = DevUnlock2Cb;
+    cb->pfnInvalidateCacheCb = DevInvalidateCacheCb;
+    cb->pfnCreateContextVirtualCb = DevCreateContextVirtualCb;
+    cb->pfnSubmitCommandCb = DevSubmitCommandCb;
+    cb->pfnCreateSynchronizationObject2Cb = DevCreateSync2Cb;
+    cb->pfnWaitForSynchronizationObjectFromCpuCb = DevWaitSyncFromCpuCb;
+    cb->pfnSignalSynchronizationObjectFromCpuCb = DevSignalSyncFromCpuCb;
+    cb->pfnWaitForSynchronizationObjectFromGpuCb = DevWaitSyncFromGpuCb;
+    cb->pfnSignalSynchronizationObjectFromGpuCb = DevSignalSyncFromGpuCb;
+    cb->pfnSignalSynchronizationObjectFromGpu2Cb = DevSignalSyncFromGpu2Cb;
+    cb->pfnDeallocate2Cb = DevDeallocate2Cb;
+    cb->pfnOfferAllocationsCb = DevOfferAllocationsCb;
+    cb->pfnReclaimAllocationsCb = DevReclaimAllocationsCb;
+    cb->pfnLogUMDMarkerCb = DevLogUMDMarkerCb;
+}
+
 typedef HRESULT(APIENTRY* PFN_OPENADAPTER)(D3DDDIARG_OPENADAPTER*);
 
 static void TryCaps(const D3DDDI_ADAPTERFUNCS& f, HANDLE hDrv, const char* name, D3DDDICAPS_TYPE type, UINT size)
@@ -711,7 +1350,7 @@ int wmain(int argc, wchar_t** argv)
     UINT iface = D3D_UMD_INTERFACE_VERSION_WIN7, version = 0x10;
     size_t decoys = 256, rounds = 1;
     DWORD delayMs = 0;
-    bool closeOnly = false, selfTest = true, noDriver = false;
+    bool closeOnly = false, selfTest = true, noDriver = false, withDevice = false;
     for (int i = 1; i < argc; i++) {
         if (!wcscmp(argv[i], L"--dll") && i + 1 < argc) dll = argv[++i];
         else if (!wcscmp(argv[i], L"--log") && i + 1 < argc) logPath = argv[++i];
@@ -738,6 +1377,10 @@ int wmain(int argc, wchar_t** argv)
         else if (!wcscmp(argv[i], L"--load-only")) closeOnly = true;
         else if (!wcscmp(argv[i], L"--no-self-test")) selfTest = false;
         else if (!wcscmp(argv[i], L"--no-driver")) noDriver = true;
+        else if (!wcscmp(argv[i], L"--device")) withDevice = true;
+        else if (!wcscmp(argv[i], L"--escape-zero")) g_escapeZero = true;
+        else if (!wcscmp(argv[i], L"--gpu-va-base") && i + 1 < argc) g_gpuVaBase = wcstoull(argv[++i], nullptr, 0);
+        else if (!wcscmp(argv[i], L"--lock-size") && i + 1 < argc) g_lockSize = (SIZE_T)wcstoull(argv[++i], nullptr, 0);
         else if (!wcscmp(argv[i], L"--json") && i + 1 < argc) jsonPath = argv[++i];
         else { wprintf(L"unknown option %s\n", argv[i]); return 2; }
     }
@@ -806,7 +1449,7 @@ int wmain(int argc, wchar_t** argv)
 
     if (rounds) Checkpoint("before load");
 
-    HRESULT lastOpenHr = E_FAIL;
+    HRESULT lastOpenHr = E_FAIL, lastCreateDeviceHr = E_FAIL;
     size_t roundsDone = 0;
     if (noDriver) { Log("--no-driver: the heap was measured and the detector checked; no driver was loaded"); rounds = 0; }
     for (size_t round = 1; round <= rounds; round++) {
@@ -853,6 +1496,55 @@ int wmain(int argc, wchar_t** argv)
                         D3DDDICAPS_GETVIDEOPROCESSORDEVICEGUIDCOUNT, 4);
                 Checkpoint(at("after GetCaps"));
             }
+            // The device phase. The field dumps all have the driver unloaded by the time they were written, so
+            // the driver had been through CreateDevice and teardown; that is the window, and the adapter phase
+            // before it barely touches the heap.
+            if (SUCCEEDED(hr) && withDevice && funcs.pfnCreateDevice) {
+                static D3DDDI_DEVICECALLBACKS devCb;
+                FillDeviceCallbacks(&devCb);
+
+                static int rtDevice = 'cveD';
+                void* devFuncs[512] = {};
+                FakeContext deviceBuffers{};
+                if (!SizeContext(&deviceBuffers, 0, 0, 0)) { Log("out of memory for the device buffers"); return 1; }
+
+                D3DDDIARG_CREATEDEVICE cd = {};
+                cd.hDevice = &rtDevice;
+                cd.Interface = iface;
+                cd.Version = version;
+                cd.pCallbacks = &devCb;
+                cd.pCommandBuffer = deviceBuffers.cmd;
+                cd.CommandBufferSize = deviceBuffers.cmdSize;
+                cd.pAllocationList = deviceBuffers.allocList;
+                cd.AllocationListSize = deviceBuffers.allocListSize;
+                cd.pPatchLocationList = deviceBuffers.patchList;
+                cd.PatchLocationListSize = deviceBuffers.patchListSize;
+                cd.pDeviceFuncs = (D3DDDI_DEVICEFUNCS*)devFuncs;
+                cd.CommandBuffer = deviceBuffers.cmdGpuVa;
+
+                size_t stubsBefore = g_devStubHits;
+                HRESULT dhr = funcs.pfnCreateDevice(oa.hAdapter, &cd);
+                lastCreateDeviceHr = dhr;
+                size_t filled = 0;
+                for (size_t i = 0; i < 512; i++) if (devFuncs[i]) filled++;
+                Log("CreateDevice = %08lx  device funcs filled: %zu slots  callback stubs hit: %zu", dhr, filled,
+                    g_devStubHits - stubsBefore);
+                Log("    fake kernel so far: %zu allocations, %zu contexts, %zu submissions", g_fakeAllocs.size(),
+                    g_fakeContexts.size(), g_submits);
+                Checkpoint(at("after CreateDevice"));
+
+                if (SUCCEEDED(dhr)) {
+                    auto* df = (D3DDDI_DEVICEFUNCS*)devFuncs;
+                    if (df->pfnDestroyDevice) {
+                        HRESULT ddhr = df->pfnDestroyDevice(cd.hDevice);
+                        Log("DestroyDevice = %08lx", ddhr);
+                    } else {
+                        Log("the driver filled no pfnDestroyDevice, so the device is left as it is");
+                    }
+                    Checkpoint(at("after DestroyDevice"));
+                }
+            }
+
             if (SUCCEEDED(hr) && funcs.pfnCloseAdapter) {
                 HRESULT c = funcs.pfnCloseAdapter(oa.hAdapter);
                 Log("CloseAdapter = %08lx", c);
@@ -905,6 +1597,10 @@ int wmain(int argc, wchar_t** argv)
             fprintf(j, "  \"roundsRequested\": %zu,\n", rounds);
             fprintf(j, "  \"roundsDone\": %zu,\n", roundsDone);
             fprintf(j, "  \"lastOpenAdapterHr\": %ld,\n", (long)lastOpenHr);
+            fprintf(j, "  \"devicePhase\": %s,\n", withDevice ? "true" : "false");
+            fprintf(j, "  \"lastCreateDeviceHr\": %ld,\n", (long)lastCreateDeviceHr);
+            fprintf(j, "  \"fakeKernelSubmissions\": %zu,\n", g_submits);
+            fprintf(j, "  \"deviceCallbackStubsHit\": %zu,\n", g_devStubHits);
             fprintf(j, "  \"selfTestRun\": %s,\n", selfTest ? "true" : "false");
             fprintf(j, "  \"selfTestPassed\": %s,\n", selfTestPassed ? "true" : "false");
             fprintf(j, "  \"stride\": %zu,\n", (size_t)g_stride);
