@@ -1,5 +1,6 @@
 build/
 results/
+scratch/
 *.log
 
 # The legacy AMD driver binaries are not redistributed here. See drivers\README.md.

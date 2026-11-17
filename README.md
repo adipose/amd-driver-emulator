@@ -38,46 +38,65 @@ On Windows 10 22H2 (19045) with an AMD Radeon 780M, 2026-11-15:
 | Detect a planted heap-damage pattern in a live heap walk | yes |
 | Host the current D3D11 UMD (`amdxx64.dll`) through `CreateDevice` and render | yes, clear and read back |
 | Drive the legacy driver into `CreateDevice` with a faked kernel | yes, 35 kernel callbacks deep |
-| Get the legacy driver's `CreateDevice` to succeed | no, see below |
+| Get the legacy driver's `CreateDevice` to succeed | yes, with an invented adapter record |
 
-## Where the legacy device phase stops
+## The legacy device phase
 
 `--device` runs `CreateDevice` with the kernel side faked: allocations backed
-by guarded virtual memory, invented GPU virtual addresses, paging queues,
-and submissions accepted and reported complete. The driver gets a long way in
-and then gives up, and what it needs next is a plausible description of
-hardware nobody here has.
+by guarded virtual memory, invented GPU virtual addresses, paging queues, and
+submissions accepted and reported complete. The driver reads a description of
+its hardware from a private adapter record, and with a minimal invented record
+it completes device creation.
 
-What the probe established about how it decides:
+The record is read by the DDI entry at `atiumd64+0x18E0`, in two queries
+through the same `pfnQueryAdapterInfoCb` callback. The first is `0x260` (608)
+bytes: the returned record's first dword must equal `0x260` (checked at
+`+0x1914`), the checksum at `+0xC` is verified only when non-zero, and `+0x1F4`
+is a flags dword whose bit 7 selects the WDDM 2 memory model (paging queues,
+GPU virtual addresses, `SubmitCommand`) over WDDM 1.x and whose bit 10
+(`0x400`) gates the second query. The second, issued at `+0x1C19` only when
+bit 10 is set, is `0x3A00` (14848) bytes into adapter context `+0x280`, and is
+where the hardware and memory description lives.
 
-- **Bit 7 of the adapter record's flags at `+0x1F4` chooses the memory
-  model.** Clear, and the driver uses the WDDM 1.x path (`RenderCb`, command
-  buffers from the runtime) and fails in its context setup at
-  `atiumd64+0x58A90`. Set, and it uses the WDDM 2 path: paging queues, GPU
-  virtual addresses, residency, `SubmitCommand`. The WDDM 2 path gets further,
-  so that is the default the scripts pass.
-- **Bit 10 (`0x400`)** makes it ask for a second, 14848-byte adapter record
-  into `adapter+0x280`, which is where its hardware description lives.
-- **The record's checksum at `+0xC` is only verified when non-zero**, so
-  fields can be invented freely as long as that dword is left at zero. It is a
-  XOR-and-add over the 152 dwords of the record.
-- **Invented GPU virtual addresses have to be low.** With a base of `0x10000`
-  the driver accepts them and proceeds to build PM4 command packets; at
-  `0x100000` and above it refuses with `E_OUTOFMEMORY`. The limit it believes
-  in comes from the record.
-- **What is left is the record's contents.** With it near-empty the driver
-  reaches a "reserve space in the command buffer" call that returns null and
-  faults writing a packet header to address 0 (`atiumd64+0x5447BF`). Filling
-  the record with a small non-zero pattern takes it further still (35
-  callbacks, four paging queues) but it then refuses cleanly. Each remaining
-  field has to be found by tracing the code that reads it.
+The minimal set of fields that gets `CreateDevice` to return `S_OK`, every
+other byte of both records left zero:
 
-Two things worth keeping in mind about that work. A clean run under an
-invented record proves very little, because the driver is taking the paths
-that record selects. But a write outside its own allocation, which the guard
-zones catch, is wrong on any hardware and would be worth having whatever the
-record said. The evidence this harness can produce is asymmetric, and only one
-side of it is worth chasing.
+    --qai-set  0=0x260,0x30=0x5a,0x3c=8,0x1f4=0x480,0xd4=2
+    --qai-set2 0x2a00=1,0x2a04=1,0x2c2c=1,0x2c30=1
+    --gpu-va-base 0x20000
+
+In the first record: `+0x0` the size; `+0x30` a chip/family selector (`0x5a`
+or `0x5b`); `+0x3C` a count that must be exactly 8; `+0x1F4` the flags
+(`0x80|0x400`); and `+0xD4` a count of at least two, which caps at four and
+gates a per-entry copy loop at `+0x1A39`, so it reads like an engine or ring
+count. In the second record, four gates are read back through the device
+object: a memory-size field at `+0x2A00`/`+0x2A04` (checked at `+0x7BAD7` and
+`+0x7BAE4`) and two flags at `+0x2C2C`/`+0x2C30` (`+0x7BAFE`, `+0x7BAF1`).
+
+When any of those second-record gates reads zero, the driver takes a branch to
+`+0x7BD80` that returns `S_OK` without initialising its command-buffer manager;
+a later command emit then dereferences the null manager and faults writing a
+packet header to address 0 (`+0x5447BF`). A driver that reports success while
+leaving a subsystem uninitialised is a defect in its own right, independent of
+the invented record.
+
+One field looks like a magic number and is not. A blanket byte-fill of both
+records reaches `CreateDevice` only for the fill bytes `0x01` and `0x08`, not
+`0x02`, `0x04` or `0x0C`. The sensitive byte is at second-record `+0xC06`, read
+at `+0x132941`, and the measured rule is `(byte & 7) <= 1`: `0x01` and `0x08`
+satisfy it and the others do not. It is a byte read, not a dword.
+
+Past `CreateDevice` the next wall is synchronisation: the driver makes its
+allocations resident and then waits on a monitored fence the faked kernel never
+advances, spinning in `WaitForSynchronizationObjectFromGpuCb` until the stack
+overflows. Reporting that fence already complete is the next step.
+
+Two things worth keeping in mind. A clean run under an invented record proves
+very little, because the driver takes the paths that record selects, which are
+not necessarily the ones a real card of that family would select. But a write
+outside its own allocation, which the guard zones catch, is wrong on any
+hardware and would be worth having whatever the record said. The evidence this
+harness can produce is asymmetric, and only one side of it is worth chasing.
 
 ## What it needs
 

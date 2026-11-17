@@ -15,7 +15,7 @@ param(
     [string] $Dll,
     # The invented adapter fields are the minimum the 2015 driver checks before it will open: record size,
     # family 8, and a chip id and revision in the TeraScale range. Without them OpenAdapter faults early.
-    [string] $ProbeArgs = '--rounds 12 --decoys 32 --qai-set 0=0x260,0x3c=8,0x30=0x5a,0x34=0x3c',
+    [string] $ProbeArgs = '--rounds 1 --decoys 256 --redzone --device --workload --workload-dangle --workload-stale-draw --workload-rounds 16 --gpu-va-base 0x20000 --qai-set 0=0x260,0x30=0x5a,0x3c=8,0x1f4=0x480,0xd4=2 --qai-set2 0x2a00=1,0x2a04=1,0x2c2c=1,0x2c30=1',
     [string] $LogPath,
     [string] $JsonPath,
     [int] $SettleSeconds = 10,
