@@ -91,7 +91,8 @@ static void PrintSizeHistogram();
 
 #include "../lib/decoy.h"
 
-// Forward declarations for fake-channel statics (defined later, used in the BP handler below).
+// Forward declarations used in the BP handler below (defined later in the file).
+static size_t g_clearAHits = 0;   // clear.A BP hit count; used by --hw-test PASS/FAIL
 static uint8_t* s_fakeChannel;
 static void* s_fakeStateVtbl[64];
 static void* s_fakeResourceVtbl[64]; // vtable for s_fakeResource: slot 7 = StubRet1 (texture gate)
@@ -331,6 +332,7 @@ static void OnBp(EXCEPTION_POINTERS* ep)
             for (auto& d : g_decoys)
                 if (tgt >= (uintptr_t)d.block && tgt < (uintptr_t)d.block + 152)
                     { hit = true; break; }
+            if (!strcmp(b.tag, "clear.A")) g_clearAHits++;
             Log("       clear write: target=%p [target+0x64]=%p %s",
                 (void*)tgt, (void*)(tgt + 0x64), hit ? "*** DECOY HIT ***" : "not a decoy");
         } else if (!strcmp(b.tag, "relobj")) {
@@ -2294,6 +2296,10 @@ static size_t g_wlOk = 0, g_wlFailed = 0, g_wlMissing = 0;
 static bool g_wlDangle = false; // --workload-dangle: destroy a bound texture without unbinding it first
 static bool g_wlStaleDraw = false; // --workload-stale-draw: after destroy, issue another draw before the next bind
 static bool g_wlReset = false; // --workload-reset: between iterations, run the device-lost/Reset DDI sequence
+static bool g_hwTest = false;      // --hw-test: real-hardware fix verification (implies --kmt-forward --qai-forward
+                                   // --bp-clear --device --workload --workload-dangle --workload-stale-draw).
+                                   // PASS/FAIL is based on g_clearAHits rather than decoy writes.
+                                   // Bug proof: expect hits > 0.  Fix proof (+ --workload-fix-unbind): expect 0.
 static bool g_wlFixUnbind = false; // --workload-fix-unbind: unbind all stages immediately before each DestroyResource,
                                    // modelling the fix applied to MPCVR and the built-in renderer.
                                    // LIMITATION: does NOT suppress decoy hits when used with --bp-clear --fake-draw-params.
@@ -2726,6 +2732,18 @@ int wmain(int argc, wchar_t** argv)
             }
         }
         else if (!wcscmp(argv[i], L"--kmt-forward")) g_kmtForward = true;
+        else if (!wcscmp(argv[i], L"--hw-test")) {
+            // Real-hardware fix verification. Implies everything needed to reach atiumd6a's clear path
+            // via the native GPU draw pipeline. Use --workload-fix-unbind alongside to test the fix.
+            g_hwTest = true;
+            g_kmtForward = true;
+            g_qaiForward = true;
+            g_bpClear = true;
+            withDevice = true;
+            withWorkload = true;
+            g_wlDangle = true;
+            g_wlStaleDraw = true;
+        }
         else if (!wcscmp(argv[i], L"--load-only")) closeOnly = true;
         else if (!wcscmp(argv[i], L"--no-self-test")) selfTest = false;
         else if (!wcscmp(argv[i], L"--no-driver")) noDriver = true;
@@ -3017,8 +3035,19 @@ int wmain(int argc, wchar_t** argv)
                         else RunWorkload(cd.hDevice, df, workloadRounds);
                         Checkpoint(at("after workload"));
                         g_workloadDone = true;
-                        Log("SUMMARY: decoy hits=%zu (%zu decoys)", g_decoyHits, g_decoys.size());
-                        if (g_wlFixUnbind) {
+                        Log("SUMMARY: decoy hits=%zu (%zu decoys)  clear.A hits=%zu",
+                            g_decoyHits, g_decoys.size(), g_clearAHits);
+                        if (g_hwTest) {
+                            // On real TeraScale hardware the clear path runs via the native GPU pipeline;
+                            // g_clearAHits is the authoritative signal (no fake channel needed).
+                            if (g_wlFixUnbind) {
+                                if (g_clearAHits == 0) Log("PROBE DONE (hw-test fix: PASS — SetTexture(null) suppressed clear write)");
+                                else                   Log("PROBE DONE (hw-test fix: FAIL — %zu clear.A hits despite unbind before destroy)", g_clearAHits);
+                            } else {
+                                if (g_clearAHits > 0)  Log("PROBE DONE (hw-test bug: PASS — clear write confirmed, %zu clear.A hits)", g_clearAHits);
+                                else                   Log("PROBE DONE (hw-test bug: FAIL — clear.A never fired; wrong hardware or driver?)");
+                            }
+                        } else if (g_wlFixUnbind) {
                             if (g_decoyHits == 0) Log("PROBE DONE (fix-unbind: PASS — clear write suppressed)");
                             else                  Log("PROBE DONE (fix-unbind: FAIL — %zu hits despite unbind before destroy)", g_decoyHits);
                         } else {
