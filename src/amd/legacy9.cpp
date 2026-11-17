@@ -2294,9 +2294,14 @@ static size_t g_wlOk = 0, g_wlFailed = 0, g_wlMissing = 0;
 static bool g_wlDangle = false; // --workload-dangle: destroy a bound texture without unbinding it first
 static bool g_wlStaleDraw = false; // --workload-stale-draw: after destroy, issue another draw before the next bind
 static bool g_wlReset = false; // --workload-reset: between iterations, run the device-lost/Reset DDI sequence
-static bool g_wlFixUnbind = false; // --workload-fix-unbind: unbind all stages immediately before each DestroyResource
-                                   // (combine with --workload-dangle --workload-stale-draw to prove the fix works:
-                                   //  expected decoy hits = 0, i.e. the clear write no longer fires)
+static bool g_wlFixUnbind = false; // --workload-fix-unbind: unbind all stages immediately before each DestroyResource,
+                                   // modelling the fix applied to MPCVR and the built-in renderer.
+                                   // LIMITATION: does NOT suppress decoy hits when used with --bp-clear --fake-draw-params.
+                                   // The fake channel routes draws through s_fakeSb, a static block wired by the stateApply
+                                   // BP handler independently of the real driver state. pfnSetTexture(null) clears the real
+                                   // stage flag [stage+0x90] but not s_fakeSb, so the clear write fires regardless.
+                                   // Fix correctness is verified analytically: sub_13E8D0 checks [stage+0x90] before the
+                                   // write, and pfnSetTexture(null) zeroes it. Runtime proof requires real TeraScale hw.
 
 static void WlResult(const char* what, HRESULT hr)
 {

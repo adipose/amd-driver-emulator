@@ -15,7 +15,15 @@ param(
     [string] $Dll,
     # The invented adapter fields are the minimum the 2015 driver checks before it will open: record size,
     # family 8, and a chip id and revision in the TeraScale range. Without them OpenAdapter faults early.
-    [string] $ProbeArgs = '--rounds 1 --decoys 256 --redzone --device --workload --workload-dangle --workload-stale-draw --workload-rounds 16 --gpu-va-base 0x20000 --qai-set 0=0x260,0x30=0x5a,0x3c=8,0x1f4=0x480,0xd4=2 --qai-set2 0x2a00=1,0x2a04=1,0x2c2c=1,0x2c30=1',
+    # --bp-clear arms int3 at atiumd6a's clear-write sites and the stateApply/flush gates that drive them.
+    # --fake-draw-params sets [hDevice+0x47B0]=1 before each draw so the deferred-flush path runs; without
+    # it pfnDrawPrimitive returns S_OK but never reaches atiumd6a's sub_13E8D0, and the decoy is never hit.
+    # NOTE: --workload-fix-unbind (SetTexture(null) before DestroyResource) does NOT suppress decoy hits in
+    # this mode. The fake channel routes draws through a static fake state block (s_fakeSb) that is wired
+    # independently of the real driver state; SetTexture(null) clears the real stage flag but not s_fakeSb.
+    # Fix correctness is verified analytically: sub_13E8D0 checks [stage+0x90] before writing, and
+    # pfnSetTexture(null) zeroes that flag. Runtime fix proof requires real TeraScale hardware.
+    [string] $ProbeArgs = '--rounds 1 --decoys 256 --redzone --bp-clear --fake-draw-params --device --workload --workload-dangle --workload-stale-draw --workload-rounds 16 --gpu-va-base 0x20000 --qai-set 0=0x260,0x30=0x5a,0x3c=8,0x1f4=0x480,0xd4=2 --qai-set2 0x2a00=1,0x2a04=1,0x2c2c=1,0x2c30=1',
     [string] $LogPath,
     [string] $JsonPath,
     [int] $SettleSeconds = 10,
