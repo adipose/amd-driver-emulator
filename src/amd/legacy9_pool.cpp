@@ -25,15 +25,22 @@ struct PoolEntry { void* ptr; };
 static PoolEntry g_poolLive[256];
 static int g_poolLiveHead = 0;
 
-// ---- trampolines and originals ----------------------------------------------------------------------------
-static uint8_t* g_trampolinePage = nullptr;
-static uint8_t* g_poolAllocTramp = nullptr;
-static uint8_t* g_poolFreeTramp = nullptr;
+// ---- IAT-style function-pointer replacement ---------------------------------------------------------------
+// The pool alloc/free are dispatched through QWORD pointers in atiumd6a's data section (a pool-manager
+// vtable), and the actual functions live in a different AMD module outside atiumd6a's image range.
+// A 5-byte rel32 patch can't bridge that gap, so we replace the pointer in the vtable instead.
+// The original pointer is stored separately; each hook calls it directly with no trampoline.
 
-typedef void* (*PoolAllocFn)(void* a0, size_t size, ULONG_PTR a2, ULONG_PTR a3);
-typedef void  (*PoolFreeFn)(void* p, ULONG_PTR a1, ULONG_PTR a2, ULONG_PTR a3);
+// True alloc: pool_alloc(pool_mgr, template_obj, ...) — size is NOT an argument; the pool
+// is a fixed 0x98 size-class, so every return from this function is a 0x98-byte block.
+// True free:  pool_free(pool_mgr, obj, ...) — first arg is the pool manager, second is the
+// block to return.  Both are dispatched through the pool manager's vtable (ff 15).
+typedef void* (*PoolAllocFn)(void* a0, void* a1, ULONG_PTR a2, ULONG_PTR a3);
+typedef void  (*PoolFreeFn )(void* a0, void* p,  ULONG_PTR a2, ULONG_PTR a3);
 static PoolAllocFn g_poolAllocOrig = nullptr;
 static PoolFreeFn  g_poolFreeOrig = nullptr;
+static void** g_poolAllocSlot = nullptr;  // vtable slot we patched for alloc
+static void** g_poolFreeSlot  = nullptr;  // vtable slot we patched for free
 
 // ---- hardware watchpoints ---------------------------------------------------------------------------------
 struct HwWp { uintptr_t addr; void* freed_obj; bool active; };
@@ -145,10 +152,10 @@ static bool InstallHook(void* target, void* replacement, uint8_t* trampoline_out
 }
 
 // ---- the hooks ----------------------------------------------------------------------------------------------
-static void* HookPoolAlloc(void* a0, size_t size, ULONG_PTR a2, ULONG_PTR a3)
+static void* HookPoolAlloc(void* a0, void* a1, ULONG_PTR a2, ULONG_PTR a3)
 {
-    void* result = g_poolAllocOrig(a0, size, a2, a3);
-    if (result && size == 0x98) {
+    void* result = g_poolAllocOrig(a0, a1, a2, a3);
+    if (result) {
         PoolLock();
         g_poolLive[g_poolLiveHead % 256].ptr = result;
         g_poolLiveHead++;
@@ -158,7 +165,7 @@ static void* HookPoolAlloc(void* a0, size_t size, ULONG_PTR a2, ULONG_PTR a3)
     return result;
 }
 
-static void HookPoolFree(void* p, ULONG_PTR a1, ULONG_PTR a2, ULONG_PTR a3)
+static void HookPoolFree(void* a0, void* p, ULONG_PTR a2, ULONG_PTR a3)
 {
     if (p) {
         bool found = false;
@@ -180,13 +187,31 @@ static void HookPoolFree(void* p, ULONG_PTR a1, ULONG_PTR a2, ULONG_PTR a3)
             ArmWriteWatchpoint((uintptr_t)inner48 + 0x64, p);
         }
     }
-    g_poolFreeOrig(p, a1, a2, a3);
+    g_poolFreeOrig(a0, p, a2, a3);
 }
 
-// ---- signature scan and install -----------------------------------------------------------------------------
-// Finds the pool allocator by its characteristic size argument: mov edx, 0x98 (ba 98 00 00 00)
-// or mov r8d, 0x98 (41 b8 98 00 00 00) immediately ahead of a call, then locates the paired
-// free by the mov rcx, rax (48 8b c8) + call pattern that follows the allocation call site.
+// ---- scan-based install ----------------------------------------------------------------------------------
+// Two-phase scan:
+//
+//   Phase 1 — find the zero-fill call site.
+//     Scan for "mov r8d, 0x98" (41 B8 98 00 00 00) followed within 32 bytes by a rel32 call.
+//     That call is a rep-stosb / memset variant that zeroes the freshly-allocated block.
+//     It is NOT the true pool alloc; it is an anchor for phase 2.
+//
+//   Phase 2 — find the TRUE alloc by scanning backwards from the zero-fill call site.
+//     The calling sequence is:
+//       call TRUE_ALLOC     ; returns new block pointer in rax
+//       ...
+//       mov rcx, rax        ; 48 8B C8 — move pointer to rcx for the zero-fill call
+//       [xor edx, edx]      ; fill = 0
+//       mov r8d, 0x98       ; size = 0x98
+//       call ZERO_FILL      ; ← zero-fill call site
+//     Scan backwards from the zero-fill site for "48 8B C8", then backwards from there for E8.
+//
+//   Phase 3 — emit a hex dump of ±160 bytes around the zero-fill call site so we can
+//     identify the pool-free function in the same function body.
+//
+// The pool-free function is found in the hex dump; it will be hardcoded in a follow-up.
 static void ShimHookPool()
 {
     static bool installed = false;
@@ -202,86 +227,117 @@ static void ShimHookPool()
     if (nt->Signature != IMAGE_NT_SIGNATURE) { Log("pool: bad NT header"); return; }
     size_t imageSize = nt->OptionalHeader.SizeOfImage;
 
-    uint8_t* scan = base + 0x1000;
-    uint8_t* end = base + imageSize - 32;
-    uint8_t* poolAllocFn = nullptr;
-    uint8_t* allocCallSite = nullptr;
-    for (uint8_t* p = scan; p < end && !allocCallSite; p++) {
-        bool sizeArg = (p[0] == 0xba && p[1] == 0x98 && p[2] == 0x00 && p[3] == 0x00 && p[4] == 0x00) ||
-                       (p[0] == 0x41 && p[1] == 0xb8 && p[2] == 0x98 && p[3] == 0x00 && p[4] == 0x00 && p[5] == 0x00);
-        if (!sizeArg) continue;
-        size_t prefix = (p[0] == 0x41) ? 6 : 5;
-        for (size_t j = prefix; j < prefix + 32; j++) {
-            if (p[j] == 0xE8) {
-                int32_t rel = *(int32_t*)(p + j + 1);
-                poolAllocFn = p + j + 5 + rel;
-                allocCallSite = p + j;
-                break;
-            }
-        }
-    }
-    if (!allocCallSite) {
-        Log("pool: warning: pool-alloc signature (size 0x98 + call) not found in atiumd6a.dll");
-        return;
-    }
+    // ---- Phase 1: find the zero-fill call site ---------------------------------------------------------
+    uint8_t* zeroFillCallSite = nullptr;
+    uint8_t* zeroFillFn       = nullptr;
 
-    // Log the alloc function's RVA so we can match against the known pool-function pair
-    // 0x83E100 / 0x2D5280 (from prior analysis of atiumd6a).
-    uintptr_t allocRva = (uintptr_t)poolAllocFn - (uintptr_t)base;
-    Log("pool: alloc function at %p (RVA=0x%llx, call site %p)",
-        (void*)poolAllocFn, (unsigned long long)allocRva, (void*)allocCallSite);
-
-    // The two known pool-function RVAs: one is alloc, the other is free.
-    // Whichever the scan found as alloc, use the partner as free.
-    static const uintptr_t kPoolRvaA = 0x83E100;
-    static const uintptr_t kPoolRvaB = 0x2D5280;
-    uint8_t* poolFreeFn = nullptr;
-    if (allocRva == kPoolRvaA)
-        poolFreeFn = base + kPoolRvaB;
-    else if (allocRva == kPoolRvaB)
-        poolFreeFn = base + kPoolRvaA;
-    else {
-        // Known RVAs don't match this build — fall back to narrow pattern scan.
-        Log("pool: alloc RVA 0x%llx doesn't match known pair (0x%llx/0x%llx), trying pattern scan",
-            (unsigned long long)allocRva,
-            (unsigned long long)kPoolRvaA, (unsigned long long)kPoolRvaB);
-        for (uint8_t* p = allocCallSite + 5; p < allocCallSite + 5 + 256 && !poolFreeFn; p++) {
-            if (p[0] == 0x48 && p[1] == 0x8b && p[2] == 0xc8) { // mov rcx, rax
-                for (size_t j = 3; j < 3 + 16; j++) {
-                    if (p[j] == 0xE8) {
-                        int32_t rel = *(int32_t*)(p + j + 1);
-                        poolFreeFn = p + j + 5 + rel;
-                        break;
+    // Limit scan to first 2 MB: the call site is at RVA ~0x5FC4, well within that range.
+    uint8_t* scanEnd = base + (imageSize < 0x200000 ? imageSize : 0x200000) - 32;
+    for (uint8_t* p = base + 0x1000; p < scanEnd && !zeroFillCallSite; p++) {
+        // mov r8d, 0x98: 41 B8 98 00 00 00
+        if (p[0] == 0x41 && p[1] == 0xB8 && p[2] == 0x98 &&
+            p[3] == 0x00 && p[4] == 0x00 && p[5] == 0x00) {
+            for (int j = 6; j < 38 && !zeroFillCallSite; j++) {
+                if (p[j] == 0xE8) {
+                    int32_t rel = *(int32_t*)(p + j + 1);
+                    uint8_t* target = p + j + 5 + rel;
+                    uintptr_t rva = (uintptr_t)target - (uintptr_t)base;
+                    if (rva >= 0x1000 && rva < imageSize) {
+                        zeroFillCallSite = p + j;
+                        zeroFillFn       = target;
                     }
                 }
             }
         }
     }
-    if (!poolFreeFn) {
-        Log("pool: warning: could not locate pool-free function (alloc RVA=0x%llx)",
-            (unsigned long long)allocRva);
+
+    if (!zeroFillCallSite) {
+        Log("pool: warning: could not find zero-fill call site");
         return;
     }
-    Log("pool: free function at %p (RVA=0x%llx)", (void*)poolFreeFn,
-        (unsigned long long)((uintptr_t)poolFreeFn - (uintptr_t)base));
-    Log("pool: pairing confirmed: alloc=%p free=%p", (void*)poolAllocFn, (void*)poolFreeFn);
+    Log("pool: zero-fill call site %p (RVA=0x%llx), zero-fill fn %p (RVA=0x%llx)",
+        (void*)zeroFillCallSite,
+        (unsigned long long)((uintptr_t)zeroFillCallSite - (uintptr_t)base),
+        (void*)zeroFillFn,
+        (unsigned long long)((uintptr_t)zeroFillFn       - (uintptr_t)base));
 
-    g_trampolinePage = (uint8_t*)VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE,
-                                              PAGE_EXECUTE_READWRITE);
-    if (!g_trampolinePage) {
-        Log("pool: VirtualAlloc for trampolines failed (%lu)", GetLastError());
+    // ---- Phase 2: forward scan for the indirect pool-alloc dispatch (ff 15) -------------------------
+    // The allocation call uses an indirect dispatch (ff 15) through the pool manager's vtable.
+    // It follows the zero-fill call after a few arg-setup instructions:
+    //   call ZERO_FILL          ← zeroFillCallSite (+0)
+    //   mov rsi, [rbp+0x77]
+    //   ...                     (arg setup: pool_mgr in rcx, template ptr in rdx)
+    //   call [rip+disp]  (ff 15)  ← the true pool alloc, ~+60 bytes from zeroFillCallSite
+    //
+    // The vtable slot immediately after (+8 bytes) is the companion pool-free function.
+    uint8_t* trueAllocFn = nullptr;
+    uint8_t* trueFreeFn  = nullptr;
+
+    for (int fwd = 5; fwd <= 128 && !trueAllocFn; fwd++) {
+        uint8_t* p = zeroFillCallSite + fwd;
+        if (p[0] != 0xFF || p[1] != 0x15) continue;
+        int32_t disp = *(int32_t*)(p + 2);
+        uint8_t** fnPtrAddr = (uint8_t**)(p + 6 + (ptrdiff_t)disp);
+        uint8_t* candidate = nullptr;
+        __try { candidate = *fnPtrAddr; } __except(EXCEPTION_EXECUTE_HANDLER) { continue; }
+        // Don't require the alloc function to be inside atiumd6a — it may live in a
+        // different AMD module.  Just check the pointer is in an executable page.
+        MEMORY_BASIC_INFORMATION mbi = {};
+        if (!VirtualQuery(candidate, &mbi, sizeof(mbi))) continue;
+        if (!(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                             PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) continue;
+        trueAllocFn = candidate;
+        g_poolAllocSlot = (void**)fnPtrAddr;
+
+        // Try the adjacent vtable slot (+8 bytes) for the pool-free companion.
+        uint8_t* freeCand = nullptr;
+        __try { freeCand = *(fnPtrAddr + 1); } __except(EXCEPTION_EXECUTE_HANDLER) {}
+        MEMORY_BASIC_INFORMATION mbif = {};
+        if (freeCand && VirtualQuery(freeCand, &mbif, sizeof(mbif)) &&
+            (mbif.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                             PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) &&
+            freeCand != trueAllocFn) {
+            trueFreeFn = freeCand;
+            g_poolFreeSlot = (void**)(fnPtrAddr + 1);
+        }
+        Log("pool: vtable at %p -> alloc=%p free=%p", (void*)fnPtrAddr,
+            (void*)trueAllocFn, (void*)trueFreeFn);
+    }
+
+    if (!trueAllocFn) {
+        Log("pool: warning: forward ff-15 scan could not find pool alloc");
         return;
     }
-    memset(g_trampolinePage, 0x90, 4096);
-    g_poolAllocTramp = g_trampolinePage;
-    g_poolFreeTramp = g_trampolinePage + 32;
 
-    if (!InstallHook(poolAllocFn, (void*)&HookPoolAlloc, g_poolAllocTramp)) return;
-    if (!InstallHook(poolFreeFn, (void*)&HookPoolFree, g_poolFreeTramp)) return;
-    g_poolAllocOrig = (PoolAllocFn)g_poolAllocTramp;
-    g_poolFreeOrig = (PoolFreeFn)g_poolFreeTramp;
+    // ---- Install hooks via vtable-slot replacement (IAT style) ---------------------------------------
+    // The driver dispatches through these pointers; replace them with our hook functions.
+    // The original function addresses are stored in g_poolAllocOrig/g_poolFreeOrig for the
+    // hooks to call directly — no trampoline or rel32 patch needed.
+    auto PatchSlot = [](void** slot, void* hook, void** origOut, const char* name) -> bool {
+        DWORD old;
+        if (!VirtualProtect(slot, 8, PAGE_READWRITE, &old)) {
+            Log("pool: VirtualProtect(%s slot %p) failed (%lu)", name, (void*)slot, GetLastError());
+            return false;
+        }
+        *origOut = *slot;
+        *slot = hook;
+        VirtualProtect(slot, 8, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), slot, 8);
+        Log("pool: patched %s slot %p: %p -> %p", name, (void*)slot, *origOut, hook);
+        return true;
+    };
+
+    void* allocOrig = nullptr;
+    if (!PatchSlot(g_poolAllocSlot, (void*)&HookPoolAlloc, &allocOrig, "alloc")) return;
+    g_poolAllocOrig = (PoolAllocFn)allocOrig;
     installed = true;
-    Log("pool: allocator hooks installed (trampolines at %p)", (void*)g_trampolinePage);
+
+    if (g_poolFreeSlot) {
+        void* freeOrig = nullptr;
+        if (PatchSlot(g_poolFreeSlot, (void*)&HookPoolFree, &freeOrig, "free"))
+            g_poolFreeOrig = (PoolFreeFn)freeOrig;
+    }
+    Log("pool: hooks installed (alloc%s)", g_poolFreeOrig ? " + free" : " only");
 }
 
 #endif // D3D9SHIM_DLL
