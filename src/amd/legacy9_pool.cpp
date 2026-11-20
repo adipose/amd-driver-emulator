@@ -21,9 +21,9 @@ static BOOL CALLBACK PoolCsInit(PINIT_ONCE, PVOID, PVOID*) { InitializeCriticalS
 static void PoolLock() { InitOnceExecuteOnce(&g_poolCsOnce, PoolCsInit, nullptr, nullptr); EnterCriticalSection(&g_poolCs); }
 static void PoolUnlock() { LeaveCriticalSection(&g_poolCs); }
 
-struct PoolEntry { void* ptr; };
-static PoolEntry g_poolLive[256];
-static int g_poolLiveHead = 0;
+struct FencedBlock { void* page_base; void* obj_ptr; bool triggered; };
+static FencedBlock g_fenced[256];
+static int         g_fencedCount = 0;
 
 // ---- IAT-style function-pointer replacement ---------------------------------------------------------------
 // The pool alloc/free are dispatched through QWORD pointers in atiumd6a's data section (a pool-manager
@@ -106,7 +106,16 @@ static bool HandleHwWpException(EXCEPTION_POINTERS* ep)
     if (dr6 & 0xF) {
         for (int i = 0; i < 4; i++) {
             if (!g_hwWp[i].active || !(dr6 & (1ULL << i))) continue;
-            Log("*** REAL UAF WRITE: target=%p freed_obj=%p", (void*)g_hwWp[i].addr, g_hwWp[i].freed_obj);
+            uintptr_t rip = ep->ContextRecord->Rip;
+            HMODULE hmod = nullptr;
+            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCSTR)rip, &hmod);
+            char modName[MAX_PATH] = "?";
+            if (hmod) GetModuleFileNameA(hmod, modName, sizeof(modName));
+            Log("*** REAL UAF WRITE: target=%p freed_obj=%p rip=%p (%s+0x%llx)",
+                (void*)g_hwWp[i].addr, g_hwWp[i].freed_obj, (void*)rip,
+                modName, (unsigned long long)(rip - (uintptr_t)hmod));
             g_hwWp[i].active = false;
             // Disarm this slot in the faulting thread: clear the enable and condition bits.
             DWORD64 mask = (1ULL << (2 * i)) | (0xFULL << (16 + 4 * i));
@@ -154,39 +163,45 @@ static bool InstallHook(void* target, void* replacement, uint8_t* trampoline_out
 // ---- the hooks ----------------------------------------------------------------------------------------------
 static void* HookPoolAlloc(void* a0, void* a1, ULONG_PTR a2, ULONG_PTR a3)
 {
-    void* result = g_poolAllocOrig(a0, a1, a2, a3);
-    if (result) {
-        PoolLock();
-        g_poolLive[g_poolLiveHead % 256].ptr = result;
-        g_poolLiveHead++;
-        PoolUnlock();
-        Log("pool: alloc 0x98 -> %p", result);
+    void* orig = g_poolAllocOrig(a0, a1, a2, a3);
+    if (!orig) return nullptr;
+    if (!g_poolFreeOrig) return orig; // free hook not installed; can't fence safely
+    void* page = VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!page) {
+        Log("pool: VirtualAlloc for fence page failed; falling back");
+        return orig;
     }
-    return result;
+    memcpy(page, orig, 0x98);
+    g_poolFreeOrig(a0, orig, a2, a3);
+    PoolLock();
+    if (g_fencedCount < 256) {
+        g_fenced[g_fencedCount++] = FencedBlock{ page, page, false };
+    }
+    PoolUnlock();
+    Log("pool: alloc 0x98 -> fence page %p (orig %p freed back)", page, orig);
+    return page;
 }
 
 static void HookPoolFree(void* a0, void* p, ULONG_PTR a2, ULONG_PTR a3)
 {
-    if (p) {
-        bool found = false;
-        void* inner48 = nullptr;
-        PoolLock();
-        for (int i = 0; i < 256; i++) {
-            if (g_poolLive[i].ptr == p) {
-                g_poolLive[i].ptr = nullptr;
-                found = true;
-                break;
-            }
-        }
-        if (found) {
-            __try { inner48 = *(void**)((char*)p + 0x48); } __except(EXCEPTION_EXECUTE_HANDLER) {}
-        }
-        PoolUnlock();
-        if (found && inner48) {
-            Log("pool: free %p (inner=%p) -> watchpoint on inner+0x64", p, inner48);
-            ArmWriteWatchpoint((uintptr_t)inner48 + 0x64, p);
+    if (!p) return;
+    void* page_base = nullptr;
+    PoolLock();
+    for (int i = 0; i < g_fencedCount; i++) {
+        if (g_fenced[i].obj_ptr == p) {
+            page_base = g_fenced[i].page_base;
+            break;
         }
     }
+    PoolUnlock();
+    if (page_base) {
+        DWORD old;
+        VirtualProtect(page_base, 4096, PAGE_NOACCESS, &old);
+        Log("pool: free fence page %p -> PAGE_NOACCESS", p);
+        // Do NOT call g_poolFreeOrig: this was VirtualAlloc'd, not from the pool
+        return;
+    }
+    // Not one of ours: pass through to the original free
     g_poolFreeOrig(a0, p, a2, a3);
 }
 
