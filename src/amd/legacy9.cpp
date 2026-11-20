@@ -1,4 +1,4 @@
-// legacy9: hosts a legacy D3D9 user-mode driver (the 2015 AMD atiumd64.dll) under a fake runtime, with the
+﻿// legacy9: hosts a legacy D3D9 user-mode driver (the 2015 AMD atiumd64.dll) under a fake runtime, with the
 // kernel side faked rather than forwarded, to answer questions the MPC-HC #4257 investigation left open:
 //
 //   1. Which heap does the driver allocate from, and does it put blocks in the 152-byte size class that the
@@ -31,17 +31,33 @@
 
 // ---------------------------------------------------------------- logging
 
-static FILE* g_logFile = nullptr;
+static HANDLE g_logHandle = INVALID_HANDLE_VALUE;
+static CRITICAL_SECTION g_logCs;
+static INIT_ONCE g_logCsOnce = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK LogCsInit(PINIT_ONCE, PVOID, PVOID*) { InitializeCriticalSection(&g_logCs); return TRUE; }
 
 static void Log(const char* fmt, ...)
 {
-    char buf[2048];
+    InitOnceExecuteOnce(&g_logCsOnce, LogCsInit, nullptr, nullptr);
+    char buf[2050];
+    int n = 0;
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(buf, sizeof buf, fmt, ap);
+    // Wrapped in __try: vsnprintf may crash on driver threads whose UCRT was never initialized.
+    // WriteFile avoids all UCRT thread state and cannot trigger a secondary exception in our VEH.
+    __try { n = vsnprintf(buf, (int)(sizeof(buf) - 2), fmt, ap); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { n = 0; }
     va_end(ap);
-    printf("%s\n", buf);
-    if (g_logFile) { fprintf(g_logFile, "%s\n", buf); fflush(g_logFile); }
+    if (n < 0 || n > (int)(sizeof(buf) - 2)) n = (int)(sizeof(buf) - 2);
+    buf[n] = '\n'; buf[n+1] = '\0';
+    EnterCriticalSection(&g_logCs);
+    __try {
+        if (g_logHandle != INVALID_HANDLE_VALUE) {
+            DWORD written;
+            WriteFile(g_logHandle, buf, (DWORD)(n + 1), &written, nullptr);
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    LeaveCriticalSection(&g_logCs);
 }
 
 static void HexDump(const char* label, const void* p, size_t n, size_t maxBytes = 96)
@@ -99,12 +115,28 @@ static void* s_fakeResourceVtbl[64]; // vtable for s_fakeResource: slot 7 = Stub
 static void* s_patchedSbVtbl[64];
 static bool  s_patchedSbVtblReady = false;
 static bool  s_fakeVtblFlushPatched = false;
+static void* s_realFlush = nullptr;    // resolved once from atiumd6a; vtable slot 4 when stages are bound
 static ULONG_PTR __stdcall StubRet0();
 static ULONG_PTR __stdcall StubRet1();
 static uint8_t s_fakeSb[0x2000];     // forward-declared for stateApply use
+static uint8_t s_fakeSb80[0x100];    // forward-declared for stateApply use; [s_fakeSb+0x80] sub-object
+static void*   s_fakeSb80Vtbl[32];   // vtable for s_fakeSb80: slot 4 = StubRet1
+static uint8_t s_fakeSb80Out[64];    // object s_fakeSb80's slot-23 stub fills into the caller's out-struct
+static uint8_t s_fakeSb110[256];     // zero-filled; wired at [s_fakeSb+0x110] so the 0x128680 epilogue
+                                     // destructor (0x257900 → 0x61BD0/0x64030) reads [+0x58]/[+0x60] as 0
 static uint8_t s_fakeResource[0x200]; // forward-declared for stateApply use
 static uint8_t s_fakeInner152[0x1200]; // forward-declared; large to cover 0x2B1B60 write range
+static uint8_t s_fakeDecoyNull[256];   // safe write target when fix-unbind active: not a registered decoy
 static uint8_t s_fakeChan10[128];      // forward-declared; two-level fake for [channel+0x10]
+static bool g_fakeSbSlotsEmpty = false; // set by the fix-unbind path: stateApply routes s_fakeResource[+0x48]
+                                        // to s_fakeDecoyNull (a non-decoy safe buffer) instead of the first
+                                        // registered decoy, so the clear write lands outside the decoy pool.
+                                        // Slots are always populated (null slots crash sub_13E8D0 on [null+0xB0]).
+                                        // Defined early for stateApply use; documented with the workload flags.
+// When a real texture resource is about to be freed (IFakeD3DTexture9::Release), store its inner
+// pointer here. The next stateApply wires s_fakeResource[+0x48] to this address instead of decoy[0],
+// so clear.A writes to real_inner+0x64 and the hardware watchpoint (armed at the same address) fires.
+static void* g_wpInnerPtr = nullptr;
 
 #include "../lib/veh_bp.h"
 
@@ -125,10 +157,15 @@ static void LogFramesFrom(CONTEXT* c, int frames)
     }
 }
 
+#ifdef D3D9SHIM_DLL
+#include "legacy9_pool.cpp"
+#endif
+
 static void OnBp(EXCEPTION_POINTERS* ep)
 {
     uintptr_t at = (uintptr_t)ep->ExceptionRecord->ExceptionAddress;
-    for (auto& b : g_bps) {
+    for (size_t i = 0; i < g_bpsCount; i++) {
+        Bp& b = g_bps[i];
         if (b.addr != at) continue;
         DWORD old;
         VirtualProtect((void*)at, 1, PAGE_EXECUTE_READWRITE, &old);
@@ -183,12 +220,19 @@ static void OnBp(EXCEPTION_POINTERS* ep)
                     if (!s_fakeVtblFlushPatched) {
                         HMODULE a6a = GetModuleHandleA("atiumd6a.dll");
                         if (a6a) {
-                            s_fakeStateVtbl[4] = (char*)a6a + (0x13C950 - 0x10000);
+                            s_realFlush = (char*)a6a + (0x13C950 - 0x10000);
+                            s_fakeStateVtbl[4] = s_realFlush;
                             s_fakeStateVtbl[5] = (void*)StubRet0; // 0x13E260 → skip base-vtable crash
                             s_fakeVtblFlushPatched = true;
                             Log("       stateApply: s_fakeStateVtbl[4]=real flush %p, [5]=StubRet0", s_fakeStateVtbl[4]);
                         }
                     }
+                    // With fix-unbind's empty slots there is no bound stage, so the real flush would
+                    // find [stage+0x90]=0 and skip every stage. The fake state block has no such flag,
+                    // so model the skip by stubbing the flush outright; otherwise it walks the zeroed
+                    // s_fakeDecoyNull chain and dies on a null+0x1020 read deep in the driver.
+                    if (s_realFlush)
+                        s_fakeStateVtbl[4] = g_fakeSbSlotsEmpty ? (void*)StubRet0 : s_realFlush;
                     // s_fakeSb must be fully re-zeroed on each wiring so vtable changes
                     // from previous draws don't accumulate, then re-populate the fields we need.
                     memset(s_fakeSb, 0, sizeof s_fakeSb);
@@ -201,14 +245,47 @@ static void OnBp(EXCEPTION_POINTERS* ep)
                     for (int _off = 0x28; _off <= 0xBF; _off += 8)
                         *(void**)(s_fakeSb + _off) = s_fakeResource;
                     *(void**)(s_fakeSb + 0xA0) = nullptr;  // gate: [+0xA2] must stay 0
+                    // Wired after the 0x28..0xBF fill above so the loop doesn't overwrite it.
+                    *(void**)(s_fakeSb + 0x80) = s_fakeSb80;
+                    *(void**)(s_fakeSb + 0x110) = s_fakeSb110;
                     *(void**)(s_fakeChannel + 0x28) = s_fakeSb;
-                    // Route s_fakeResource[+0x48] → first decoy block so sub_13E8D0's
-                    // "mov rbx,[rax+0x48]" gives rbx=decoy → clear write targets the decoy.
-                    // The clrzero BP caps r8=0 to prevent the preceding 4 KB memset from
-                    // overflowing the 152-byte block; individual field writes stay in bounds.
-                    if (!g_decoys.empty()) {
-                        *(ULONG_PTR**)(s_fakeResource + 0x48) = g_decoys[0].block;
-                        Log("       stateApply: s_fakeResource[+0x48] → decoy[0] %p", g_decoys[0].block);
+                    // Route s_fakeResource[+0x48] so sub_13E8D0's "mov rbx,[rax+0x48]" has a valid
+                    // target. Priority: (1) g_wpInnerPtr — a real freed inner pointer from a real
+                    // texture resource, so clear.A writes to the real freed object and the hardware
+                    // watchpoint fires; (2) s_fakeInner152 — the 4608-byte self-referential inner-object
+                    // buffer that sub_13E8D0 uses by default; large enough to absorb the 96-byte write
+                    // at offset 0x64 without overflowing, and self-referential so driver pointer reads
+                    // loop harmlessly (the 152-byte heap decoys were overflowed by 44 bytes, while
+                    // s_fakeDecoyNull was zero-initialized causing a crash at 0x3d59c reading 0x1020).
+                    if (!g_fakeSbSlotsEmpty) {
+                        if (g_wpInnerPtr) {
+                            *(void**)(s_fakeResource + 0x48) = g_wpInnerPtr;
+                            // Arm the hardware watchpoint by writing directly into the exception
+                            // context: when OnBp returns CONTINUE_EXECUTION the OS restores this
+                            // context including Dr0/Dr7, so the watchpoint becomes live for the
+                            // state flush that follows.  This avoids RtlCaptureContext/SetThreadContext
+                            // which deadlock when called from non-VEH draw-path code.
+                            static bool s_wpArmed = false;
+                            if (!s_wpArmed) {
+                                uintptr_t wpAddr = (uintptr_t)g_wpInnerPtr + 0x64;
+                                SetDrSlot(ep->ContextRecord, 0, wpAddr);
+                                InitOnceExecuteOnce(&g_hwWpCsOnce, HwWpCsInit, nullptr, nullptr);
+                                g_hwWp[0] = HwWp{ wpAddr, s_fakeResource, true };
+                                s_wpArmed = true;
+                                Log("pool: armed DR0 write WP on %p via VEH context (inner=%p)",
+                                    (void*)wpAddr, g_wpInnerPtr);
+                            }
+                            Log("       stateApply: s_fakeResource[+0x48] → inner %p (WP armed)", g_wpInnerPtr);
+                        } else {
+                            *(void**)(s_fakeResource + 0x48) = s_fakeInner152;
+                            Log("       stateApply: s_fakeResource[+0x48] → s_fakeInner152 (safe absorb; waiting for real inner)");
+                        }
+                    } else {
+                        // Fix-unbind active: texture slots are empty so the write target must not be a decoy.
+                        // Route s_fakeResource[+0x48] to a safe static buffer; the flush runs normally
+                        // (no hang) but the clear write lands outside the decoy pool.
+                        *(ULONG_PTR**)(s_fakeResource + 0x48) = (ULONG_PTR*)s_fakeDecoyNull;
+                        Log("       stateApply: slots empty (fix-unbind active), decoy pointer cleared");
                     }
                     Log("       stateApply: wired s_fakeSb (real flush@[4], tex slots → s_fakeResource)");
                 }
@@ -219,10 +296,22 @@ static void OnBp(EXCEPTION_POINTERS* ep)
             ep->ContextRecord->R9 = (ULONG_PTR)s_fakeResource;
             Log("       flush: replaced r9 with s_fakeResource %p", s_fakeResource);
         } else if (!strcmp(b.tag, "clrzero")) {
-            // BP at the call site 13e946 (call 0x2B1B60) in sub_13E8D0.
-            // rcx=rbx=inner_obj, r8=0x1000.  Cap r8=0 → memset returns immediately (r8<8 path).
-            ep->ContextRecord->R8 = 0;
-            Log("       clrzero: capped r8=0, inner_obj=%p", (void*)ep->ContextRecord->Rcx);
+            // Skip the CALL instruction entirely (race-free alternative to capping r8).
+            // The clrzero BP is at a 5-byte CALL rel32 (original byte 0xe8); skipping it
+            // prevents both this thread and any other thread from running the uncapped
+            // memset(inner_obj, 0, 0x1000) that would overflow the 152-byte block.
+            // Re-arm the BP immediately (we un-armed it above at line 158) so other threads
+            // that reach this call site also skip it, closing the race window.
+            {
+                DWORD ra_old;
+                VirtualProtect((void*)at, 1, PAGE_EXECUTE_READWRITE, &ra_old);
+                *(unsigned char*)at = 0xCC;    // re-arm immediately
+                VirtualProtect((void*)at, 1, ra_old, &ra_old);
+            }
+            ep->ContextRecord->Rip = at + 5;   // advance past the 5-byte call instruction
+            ep->ContextRecord->EFlags &= ~0x100u;  // cancel single-step (no re-arm needed)
+            g_rearm = 0;
+            Log("       clrzero: skipped call (race-free), inner_obj=%p", (void*)ep->ContextRecord->Rcx);
         } else if (!strcmp(b.tag, "acquire")) {
             void* ctx = (void*)ep->ContextRecord->Rcx;
             __try {
@@ -366,36 +455,71 @@ static void OnBp(EXCEPTION_POINTERS* ep)
     }
 }
 
+#ifdef D3D9SHIM_DLL
+static bool HandleHwWpException(EXCEPTION_POINTERS* ep);
+static void ArmWriteWatchpoint(uintptr_t addr, void* freed_obj);
+#endif
+
 static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep)
 {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     if (code == STATUS_BREAKPOINT) {
         uintptr_t at = (uintptr_t)ep->ExceptionRecord->ExceptionAddress;
-        for (auto& b : g_bps)
-            if (b.addr == at) { OnBp(ep); return EXCEPTION_CONTINUE_EXECUTION; }
+        BpsLock();
+        for (size_t i = 0; i < g_bpsCount; i++)
+            if (g_bps[i].addr == at) { OnBp(ep); BpsUnlock(); return EXCEPTION_CONTINUE_EXECUTION; }
+        // An int3 at an armed address that matches no entry means the table was corrupted
+        // (previously: the heap vector's buffer sat in the 152-byte class and the driver's
+        // stray write zeroed it) — say so rather than passing silently.
+        char wb[300];
+        Log("!! unmatched int3 at %s (g_bps entries: %zu)", Where((void*)at, wb, sizeof wb),
+            g_bpsCount);
+        for (size_t i = 0; i < g_bpsCount; i++)
+            Log("!!   g_bps: %s at %p (orig %02x)", g_bps[i].tag, (void*)g_bps[i].addr,
+                g_bps[i].orig);
+        BpsUnlock();
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    if (code == EXCEPTION_SINGLE_STEP && g_rearm) {
-        uintptr_t at = g_rearm;
-        g_rearm = 0;
-        for (auto& b : g_bps)
-            if (b.addr == at) {
-                DWORD old;
-                VirtualProtect((void*)at, 1, PAGE_EXECUTE_READWRITE, &old);
-                *(unsigned char*)at = 0xCC;
-                VirtualProtect((void*)at, 1, old, &old);
-            }
-        ep->ContextRecord->EFlags &= ~0x100u;
+    if (code == EXCEPTION_SINGLE_STEP) {
+#ifdef D3D9SHIM_DLL
+        // A hardware watchpoint from the pool hook (legacy9_pool.cpp) also arrives as a
+        // single-step; let it claim the exception first when no bp re-arm is pending.
+        if (HandleHwWpException(ep) && !g_rearm)
+            return EXCEPTION_CONTINUE_EXECUTION;
+#endif
+        if (g_rearm) {
+            uintptr_t at = g_rearm;
+            g_rearm = 0;
+            BpsLock();
+            for (size_t i = 0; i < g_bpsCount; i++)
+                if (g_bps[i].addr == at) {
+                    DWORD old;
+                    VirtualProtect((void*)at, 1, PAGE_EXECUTE_READWRITE, &old);
+                    *(unsigned char*)at = 0xCC;
+                    VirtualProtect((void*)at, 1, old, &old);
+                }
+            BpsUnlock();
+            ep->ContextRecord->EFlags &= ~0x100u;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    char w[300];
+    if ((code >> 16) == 0x4001 &&
+        !(ep->ExceptionRecord->ExceptionFlags & EXCEPTION_NONCONTINUABLE)) {
+        // D3D/debugger notification: swallow silently so the process doesn't terminate.
         return EXCEPTION_CONTINUE_EXECUTION;
     }
-    if (code < 0xC0000000 || code == 0xE06D7363) return EXCEPTION_CONTINUE_SEARCH;
-    char w[300];
+    if (code < 0xC0000000 || code == 0xE06D7363) {
+        Log("!! non-error exception %08lx at %s", code, Where(ep->ExceptionRecord->ExceptionAddress, w, sizeof w));
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     Log("!! exception %08lx at %s", code, Where(ep->ExceptionRecord->ExceptionAddress, w, sizeof w));
     if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2)
         Log("!!   %s address %p", ep->ExceptionRecord->ExceptionInformation[0] ? "writing" : "reading",
             (void*)ep->ExceptionRecord->ExceptionInformation[1]);
-    void* st[12];
-    USHORT n = RtlCaptureStackBackTrace(0, 12, st, nullptr);
+    void* st[12] = {};
+    USHORT n = 0;
+    __try { n = RtlCaptureStackBackTrace(0, 12, st, nullptr); } __except(EXCEPTION_EXECUTE_HANDLER) {}
     for (USHORT i = 0; i < n; i++) Log("!!   frame %s", Where(st[i], w, sizeof w));
 
     // At the reserve fault (emit helper, atiumd64+0x5447bf) rcx still holds the command-buffer manager (the
@@ -446,39 +570,8 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep)
                     Where((void*)ctx2.Rip, fw2, sizeof fw2), (void*)ctx2.R14, (void*)ctx2.Rcx, (void*)ctx2.Rdx);
             }
         }
-        if (rva == 0x118753 && ep->ContextRecord) {
-            // Inside atiumd6a:0x128680+0xD3: "mov rax,[r14]" where r14=[channel+0x80]=null.
-            // The flush passes rdx (real channel) to this helper; the real channel has [+0x80]=0
-            // in this stale-draw context.  Rather than cascade through real driver code, we
-            // simulate a successful return (rax=1) by unwinding the function's stack frame.
-            //
-            // Prologue of 0x128680: 6 × push + sub rsp,0xA8 → frame = 0xD8 from retaddr.
-            // Stack at crash point (cx.Rsp = RSP0 - 0xD8):
-            //   [+0xA8]=saved rbp, [+0xB0]=saved rbx, [+0xB8]=saved rsi
-            //   [+0xC0]=saved r12, [+0xC8]=saved r14, [+0xD0]=saved r15
-            //   [+0xD8]=return address (flush:0x13CB64)
-            CONTEXT& cx = *ep->ContextRecord;
-            Log("!! 0x128680+0xD3: forced-return; r14=%p rsp=%p retaddr=%p",
-                (void*)cx.R14, (void*)cx.Rsp, (void*)*(ULONG_PTR*)(cx.Rsp + 0xD8));
-            __try {
-                // Push order: rbp, rbx, rsi, r12, r14, r15 → last pushed (r15) is at lowest addr.
-                // RSP at crash = RSP0_fn - 0xD8.  Saved registers (ascending from RSP):
-                //   [+0xA8]=r15  [+0xB0]=r14  [+0xB8]=r12  [+0xC0]=rsi  [+0xC8]=rbx  [+0xD0]=rbp
-                cx.R15 = *(ULONG_PTR*)(cx.Rsp + 0xA8);
-                cx.R14 = *(ULONG_PTR*)(cx.Rsp + 0xB0);  // flush's r14 = s_fakeSb
-                cx.R12 = *(ULONG_PTR*)(cx.Rsp + 0xB8);
-                cx.Rsi = *(ULONG_PTR*)(cx.Rsp + 0xC0);
-                cx.Rbx = *(ULONG_PTR*)(cx.Rsp + 0xC8);
-                cx.Rbp = *(ULONG_PTR*)(cx.Rsp + 0xD0);
-                ULONG_PTR retAddr = *(ULONG_PTR*)(cx.Rsp + 0xD8);
-                cx.Rsp += 0xE0;
-                cx.Rip = retAddr;
-                cx.Rax = 1;
-                return EXCEPTION_CONTINUE_EXECUTION;
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                Log("!!   forced-return read fault — unwind skipped");
-            }
-        }
+        // rva 0x118753 (atiumd6a:0x128680+0xD3): null [arg+0x80] deref — fixed by wiring
+        // s_fakeSb80 at [s_fakeSb+0x80] and [s_fakeChannel+0x80].  VEH forced-return removed.
         // All these sites share the pattern:
         //   mov rcx,[r13/rdi+0x10]; (non-null) mov rcx,[rcx+0x38]=null; then mov rax,[rcx] crash.
         // Set rcx=s_fakeChan10 (vtable=s_stubVtbl, [+0x38]=self-ref) so the subsequent virtual
@@ -515,52 +608,10 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep)
             Log("!! [ch+0x10] crash @+0x%x: rcx→fakeChan10", rva - 0x12C950);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
-        if (rva == 0x11cb9f && ep->ContextRecord) {
-            // atiumd6a:0x12CAD0+0xCF: "mov rax,[r15]" where r15=[channel+0x80]=null.
-            // Different prologue: push rbp,rbx,r12,r13,r14,r15 + mov rbp,rsp + sub rsp,0x58.
-            // Frame = 0x30 + 0x58 = 0x88.  r14 (flush's s_fakeSb) is at [rsp+0x60].
-            CONTEXT& cx = *ep->ContextRecord;
-            Log("!! 0x12CAD0+0xCF: forced-return; rsp=%p retaddr=%p",
-                (void*)cx.Rsp, (void*)*(ULONG_PTR*)(cx.Rsp + 0x88));
-            __try {
-                cx.R15 = *(ULONG_PTR*)(cx.Rsp + 0x58);
-                cx.R14 = *(ULONG_PTR*)(cx.Rsp + 0x60);
-                cx.R13 = *(ULONG_PTR*)(cx.Rsp + 0x68);
-                cx.R12 = *(ULONG_PTR*)(cx.Rsp + 0x70);
-                cx.Rbx = *(ULONG_PTR*)(cx.Rsp + 0x78);
-                cx.Rbp = *(ULONG_PTR*)(cx.Rsp + 0x80);
-                ULONG_PTR retAddr = *(ULONG_PTR*)(cx.Rsp + 0x88);
-                cx.Rsp += 0x90;
-                cx.Rip = retAddr;
-                cx.Rax = 1;
-                return EXCEPTION_CONTINUE_EXECUTION;
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                Log("!!   0x12CAD0 forced-return read fault — unwind skipped");
-            }
-        }
-        if (rva == 0x11a4f3 && ep->ContextRecord) {
-            // gate (atiumd6a:0x12A420) crashes at +0xD3 for the same reason as 0x128680:
-            // [channel+0x80]=null → r14=0 → mov rax,[r14] faults.
-            // Identical prologue: same 6-push frame + sub rsp,0xA8 → same unwind offsets.
-            CONTEXT& cx = *ep->ContextRecord;
-            Log("!! gate+0xD3: forced-return; rsp=%p retaddr=%p",
-                (void*)cx.Rsp, (void*)*(ULONG_PTR*)(cx.Rsp + 0xD8));
-            __try {
-                cx.R15 = *(ULONG_PTR*)(cx.Rsp + 0xA8);
-                cx.R14 = *(ULONG_PTR*)(cx.Rsp + 0xB0);
-                cx.R12 = *(ULONG_PTR*)(cx.Rsp + 0xB8);
-                cx.Rsi = *(ULONG_PTR*)(cx.Rsp + 0xC0);
-                cx.Rbx = *(ULONG_PTR*)(cx.Rsp + 0xC8);
-                cx.Rbp = *(ULONG_PTR*)(cx.Rsp + 0xD0);
-                ULONG_PTR retAddr = *(ULONG_PTR*)(cx.Rsp + 0xD8);
-                cx.Rsp += 0xE0;
-                cx.Rip = retAddr;
-                cx.Rax = 1;
-                return EXCEPTION_CONTINUE_EXECUTION;
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                Log("!!   gate forced-return read fault — unwind skipped");
-            }
-        }
+        // rva 0x11cb9f (atiumd6a:0x12CAD0+0xCF): null [arg+0x80] deref — same fix as
+        // 0x118753 via s_fakeSb80.  VEH forced-return removed.
+        // rva 0x11a4f3 (gate atiumd6a:0x12A420+0xD3): null [arg+0x80] deref — same fix as
+        // 0x118753 via s_fakeSb80.  VEH forced-return removed.
         if ((rva == 0x12cb06 || rva == 0x12cb23) && ep->ContextRecord) {
             // Crash inside flush — dump all GP regs to find null source.
             CONTEXT& cx = *ep->ContextRecord;
@@ -738,7 +789,7 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep)
             Log("SUMMARY (early-exit): decoy hits=%zu (%zu decoys)",
                 g_decoyHits, g_decoys.size());
             Log("PROBE DONE (early-exit: unhandled crash during teardown)");
-            if (g_logFile) fflush(g_logFile);
+            // (WriteFile is unbuffered; no fflush needed)
         }
     }
     return EXCEPTION_CONTINUE_SEARCH;
@@ -858,6 +909,14 @@ static BOOL WINAPI Hook_HeapFree(HANDLE heap, DWORD flags, LPVOID p)
         Log("  ** 152-byte-class block freed: %p (%zu bytes); contents at free:", p, l.size);
         HexDump("blk", p, l.size, l.size);
         LogStack("freed", 0, 10);
+#ifdef D3D9SHIM_DLL
+        void* inner48 = nullptr;
+        __try { inner48 = *(void**)((char*)p + 0x48); } __except(EXCEPTION_EXECUTE_HANDLER) {}
+        if (inner48 && (uintptr_t)inner48 > 0x10000) {
+            Log("  heap-free 152b: inner=%p -> arming watchpoint on inner+0x64", inner48);
+            ArmWriteWatchpoint((uintptr_t)inner48 + 0x64, p);
+        }
+#endif
     }
     if (known && l.zoned) {
         CheckZone(p, l, "on free");
@@ -1102,6 +1161,7 @@ static void PrintSizeHistogram()
 
 static wchar_t g_driverDir[MAX_PATH];
 static bool g_kmtForward = false;
+static bool g_kmtFake    = false;  // --kmt-fake: return STATUS_SUCCESS with plausible fake output (no real GPU needed)
 static bool g_bpClear = false;    // --bp-clear: arm int3 at every atiumd6a +0x64 write site; logs rcx at each hit
 static bool g_forceFlush = false; // --force-flush: set [device+0x47B0]=1 before each draw to prod the deferred flush path
 static ULONG_PTR __stdcall StubRet0() { return 0; }
@@ -1114,10 +1174,35 @@ static ULONG_PTR s_fakeStateObj[4] = { 1, 0, 0, 0 };
 static ULONG_PTR __stdcall StubRetFakeStateObj() { return (ULONG_PTR)s_fakeStateObj; }
 static ULONG_PTR __stdcall StubRetFakeResource()  { return (ULONG_PTR)s_fakeResource; }
 
+// vtable slot 23 (offset +0xB8) on s_fakeSb80: 0x128680 calls it with rdx = an out-struct
+// on its own stack, then reads object pointers from [out+0x20] and [out+0x28] and calls
+// vtable slots on them.  A plain StubRet0 leaves those stack slots uninitialised (crash at
+// 0x1287a8, "mov r8,[rbx]").  Fill both with s_fakeSb80Out, whose vtable is s_stubVtbl
+// (all StubRet0), so the follow-on calls return 0 without crashing.
+static ULONG_PTR __stdcall StubFillSb80Out(ULONG_PTR, ULONG_PTR out, ULONG_PTR, ULONG_PTR) {
+    *(void**)(out + 0x20) = s_fakeSb80Out;
+    *(void**)(out + 0x28) = s_fakeSb80Out;
+    return 0;
+}
+
 // s_fakeChanAccumBuf: destination buffer for the per-frame accumulate call
 // (atiumd6a:0x4A400 calls fake_channel->vtable[7] to get this pointer, then passes
 // it as rcx to 0x46C30 which writes 11 qwords of accumulated deltas into [rcx+8..+88]).
 static uint8_t s_fakeChanAccumBuf[128];
+
+// s_fakeSb80: sub-object wired at [s_fakeSb+0x80] and [s_fakeChannel+0x80].
+// Three sites read a null [arg+0x80] and dereference it as a C++ object:
+//   atiumd6a:0x128680+0xD3  (rva 0x118753): mov rax,[r14]  r14=[rsi+0x80]
+//   atiumd6a:0x12A420+0xD3  (rva 0x11a4f3): mov rax,[r14]  r14=[rsi+0x80]
+//   atiumd6a:0x12CAD0+0xCF  (rva 0x11cb9f): mov rax,[r15]  r15=[r14+0x80]
+// With the sub-object provided, 0x128680 calls vtable slot 4 and early-exits (return 0)
+// unless it returns 1.  The VEH forced-return these replace handed back rax=1, so
+// slot 4 = StubRet1 to preserve that behaviour.
+// (s_fakeSb80 and s_fakeSb80Vtbl are forward-declared near the top of the file.)
+// The flush also passes [stateblock+0x80] to the selector 0x4BFA0, which reads
+// [s_fakeSb80+0xB0] and returns s_fakeSb80+0x00/+0x30/+0x60 as a C++ object; the
+// object must therefore be 0x100 bytes with the vtable at all three offsets and a
+// valid selector dword at +0xB0 (2, same trial value as s_fakeResource).
 
 // s_fakeResource: minimal fake texture-resource struct placed at s_fakeSb[+0x88] (and +0x98,
 // +0x28 etc.) so the bound-resource selector 0x4BFA0 doesn't crash reading [null+0xB0].
@@ -1167,7 +1252,7 @@ static uint8_t s_fakeTable[0x1800];
 // s_patchedSbVtbl / s_patchedSbVtblReady: forward-declared near the top of the file.
 // A copy of sb_vtbl_A with slot 5 → StubRet0 to skip the 0x13E260 crash.
 
-// 256-byte fake channel object: vtable ptr at [+0] points to s_fakeChanVtbl
+// 0x200-byte fake channel object: vtable ptr at [+0] points to s_fakeChanVtbl
 // Heap-allocated to avoid issues with static lifetime (declaration near top of file)
 
 static void InitFakeVtbls() {
@@ -1215,6 +1300,21 @@ static void InitFakeVtbls() {
     // Fake state block vtable
     *(void**)s_fakeSb = s_fakeStateVtbl;
 
+    // s_fakeSb80: all-StubRet0 vtable except slot 4 = StubRet1 (see declaration comment).
+    memset(s_fakeSb80, 0, sizeof s_fakeSb80);
+    for (int i = 0; i < 32; i++) s_fakeSb80Vtbl[i] = (void*)StubRet0;
+    s_fakeSb80Vtbl[4] = (void*)StubRet1;
+    s_fakeSb80Vtbl[23] = (void*)StubFillSb80Out;
+    *(void**)s_fakeSb80 = s_fakeSb80Vtbl;
+    // Selector 0x4BFA0 returns s_fakeSb80+0x00/+0x30/+0x60 depending on [+0xB0];
+    // each returned sub-object is called through its vtable, so set all three.
+    *(void**)(s_fakeSb80 + 0x30) = s_fakeSb80Vtbl;
+    *(void**)(s_fakeSb80 + 0x60) = s_fakeSb80Vtbl;
+    *(DWORD*)(s_fakeSb80 + 0xB0) = 2;
+    *(void**)s_fakeSb80Out = s_stubVtbl;
+    *(void**)(s_fakeSb + 0x80) = s_fakeSb80;
+    *(void**)(s_fakeSb + 0x110) = s_fakeSb110;
+
     // Fake texture resource: wired at s_fakeSb[+0x88] etc so the bound-resource selector
     // 0x4BFA0 doesn't crash reading [null+0xB0].  [+0xB0]=2 is a trial value; inner-object
     // pointer placed at all three possible selected+0x48 offsets (+0x48, +0x78, +0xA8) so
@@ -1256,8 +1356,9 @@ static void InitFakeVtbls() {
     *(void**)s_fakeChan90Sub = s_stubVtbl;
     *(void**)(s_fakeChan90 + 0x20) = s_fakeChan90Sub;
 
-    // Fake channel: 256 bytes, vtable ptr at [+0]
-    s_fakeChannel = (uint8_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 256);
+    // Fake channel: 0x200 bytes, vtable ptr at [+0].  Must cover +0x110: the 0x128680
+    // epilogue destructor reads [channel+0x110] and dereferences it (0x61BD0/0x64030).
+    s_fakeChannel = (uint8_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 0x200);
     if (s_fakeChannel) *(void**)s_fakeChannel = s_fakeChanVtbl;
     s_fakeVtblsInited = true;
 }
@@ -1292,6 +1393,13 @@ static void InstallFakeChannel(HANDLE hDevice) {
     // Wire up [channel+0x10]: atiumd6a:0x13C950 reads [[channel+0x10]+0x70] for a vtable
     // object and calls vtable[+0xD0] on it.  s_fakeChan10 and s_fakeChan10Sub satisfy that.
     *(void**)(s_fakeChannel + 0x10) = s_fakeChan10;
+    // Wire [channel+0x80]: the flush helpers 0x128680 / 0x12A420 / 0x12CAD0 read
+    // [channel+0x80] (or [stateblock+0x80]) and dereference it as a C++ object.
+    *(void**)(s_fakeChannel + 0x80) = s_fakeSb80;
+    // Wire [channel+0x110]: 0x128680's epilogue destructor (0x257900) passes
+    // [channel+0x110] as rcx to 0x61BD0/0x64030, which read [rcx+0x58]/[+0x60].
+    // A zero-filled buffer makes both take their skip paths.
+    *(void**)(s_fakeChannel + 0x110) = s_fakeSb110;
     // Wire up [channel+0x28]: real state block with its vtable patched to s_fakeStateVtbl.
     // Using the real state block keeps real driver fields intact (texture slots at [+0x88]/[+0x98],
     // the texture-stage index at [+0x20], etc.) while letting us control all virtual calls on it.
@@ -1310,6 +1418,7 @@ static void InstallFakeChannel(HANDLE hDevice) {
             if (mbi.State == MEM_COMMIT &&
                 (mbi.Type == MEM_PRIVATE || mbi.Type == MEM_MAPPED) &&
                 (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) &&
+                !(mbi.Protect & PAGE_GUARD) &&
                 mbi.RegionSize >= 8) {
                 for (char* p = (char*)mbi.BaseAddress;
                      p + 8 <= (char*)mbi.BaseAddress + mbi.RegionSize;
@@ -1323,11 +1432,17 @@ static void InstallFakeChannel(HANDLE hDevice) {
                         __try { sb_from_dev = *(void**)((char*)p + 0x190); } __except(1) {}
                         Log("fake-channel: found device=%p → [+0x190]=%p", p, sb_from_dev);
                         if (sb_from_dev) {
-                            void* sb_v = nullptr;
-                            __try { sb_v = *(void**)sb_from_dev; } __except(1) {}
-                            if (sb_v == sb_vtable_A || sb_v == sb_vtable_B) {
-                                found_sb = sb_from_dev;
-                                Log("fake-channel: state_block from dev+0x190: %p vtbl=%p", found_sb, sb_v);
+                            MEMORY_BASIC_INFORMATION sb_mbi;
+                            bool sb_readable = VirtualQuery(sb_from_dev, &sb_mbi, sizeof sb_mbi) == sizeof sb_mbi
+                                            && sb_mbi.State == MEM_COMMIT
+                                            && (sb_mbi.Protect & (PAGE_READONLY|PAGE_READWRITE|PAGE_EXECUTE_READ|PAGE_EXECUTE_READWRITE));
+                            if (sb_readable) {
+                                void* sb_v = nullptr;
+                                __try { sb_v = *(void**)sb_from_dev; } __except(1) {}
+                                if (sb_v == sb_vtable_A || sb_v == sb_vtable_B) {
+                                    found_sb = sb_from_dev;
+                                    Log("fake-channel: state_block from dev+0x190: %p vtbl=%p", found_sb, sb_v);
+                                }
                             }
                         }
                     }
@@ -1354,12 +1469,35 @@ static void InstallFakeChannel(HANDLE hDevice) {
                 *(void**)((char*)found_sb + 0x88),
                 *(void**)((char*)found_sb + 0x98),
                 *(int*)((char*)found_sb + 0x20));
-            *(void**)(s_fakeChannel + 0x28) = found_sb;
-            Log("fake-channel: state_block wired → [chan+0x28]");
         } else {
-            Log("fake-channel: state_block not found — falling back to s_fakeSb");
-            *(void**)(s_fakeChannel + 0x28) = s_fakeSb;
+            Log("fake-channel: state_block not found — using s_fakeSb");
         }
+        // Always wire s_fakeSb, never found_sb: on a second call (post-Reset device recreate)
+        // the scan can find a stale or garbage address and the driver dereferences it before
+        // stateApply fires to re-wire s_fakeSb, crashing on the driver thread.
+        // Pre-initialise s_fakeSb so the driver survives the window before stateApply does
+        // the full re-setup: vtable + flush patch + texture slots (same shape stateApply makes).
+        *(void**)s_fakeSb = s_fakeStateVtbl;
+        if (!s_fakeVtblFlushPatched) {
+            HMODULE a6a = GetModuleHandleA("atiumd6a.dll");
+            if (a6a) {
+                s_realFlush = (char*)a6a + (0x13C950 - 0x10000);
+                s_fakeStateVtbl[4] = s_realFlush;
+                s_fakeStateVtbl[5] = (void*)StubRet0; // 0x13E260 → skip base-vtable crash
+                s_fakeVtblFlushPatched = true;
+                Log("fake-channel: s_fakeStateVtbl[4]=real flush %p, [5]=StubRet0", s_fakeStateVtbl[4]);
+            }
+        }
+        if (!*(void**)(s_fakeSb + 0x88)) {
+            for (int _off = 0x28; _off <= 0xBF; _off += 8)
+                *(void**)(s_fakeSb + _off) = s_fakeResource;
+            *(void**)(s_fakeSb + 0xA0) = nullptr;  // gate: [+0xA2] must stay 0
+        }
+        // Wired after the 0x28..0xBF fill above so the loop doesn't overwrite it.
+        *(void**)(s_fakeSb + 0x80) = s_fakeSb80;
+        *(void**)(s_fakeSb + 0x110) = s_fakeSb110;
+        *(void**)(s_fakeChannel + 0x28) = s_fakeSb;
+        Log("fake-channel: s_fakeSb pre-initialised and wired → [chan+0x28]");
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Log("fake-channel: exception during state_block vmem scan; using s_fakeSb");
         *(void**)(s_fakeChannel + 0x28) = s_fakeSb;
@@ -1375,11 +1513,60 @@ struct ThunkSlot { char name[64]; NTSTATUS(APIENTRY* real)(void*); };
 static ThunkSlot g_thunks[48];
 static int g_thunkCount = 0;
 
+// --kmt-fake: answer the driver's D3DKMT calls with STATUS_SUCCESS and just enough output for the
+// CPU-side draw path to run to the flush, without real hardware. Handles are a throwaway counter;
+// nothing needs tracking yet.
+static UINT32 s_nextFakeHandle = 1;
+static BYTE   s_fakeLockBuf[4096];
+
+static NTSTATUS FakeKmt(const char* name, void* arg)
+{
+    if (!strcmp(name, "D3DKMTCreateAllocation")) {
+        auto* p = (D3DKMT_CREATEALLOCATION*)arg;
+        if (p->pAllocationInfo) {
+            for (UINT i = 0; i < p->NumAllocations; i++)
+                p->pAllocationInfo[i].hAllocation = s_nextFakeHandle++;
+        }
+        p->hResource = s_nextFakeHandle++;
+        return (NTSTATUS)0;
+    }
+    if (!strcmp(name, "D3DKMTCreateSynchronizationObject")) {
+        auto* p = (D3DKMT_CREATESYNCHRONIZATIONOBJECT*)arg;
+        p->hSyncObject = s_nextFakeHandle++;
+        return (NTSTATUS)0;
+    }
+    if (!strcmp(name, "D3DKMTRender")) {
+        // Refuse the actual GPU submission: the driver bails out before spinning on a fence
+        // that the fake GPU would never signal. The deferred flush (and the clear write) has
+        // already run before this call, so refusing here is safe and avoids an infinite wait.
+        return (NTSTATUS)0xC00000BB; // STATUS_NOT_SUPPORTED
+    }
+    if (!strcmp(name, "D3DKMTLock")) {
+        auto* p = (D3DKMT_LOCK*)arg;
+        p->pData = s_fakeLockBuf;
+        return (NTSTATUS)0;
+    }
+    // DestroyAllocation, DestroySynchronizationObject, SignalSynchronizationObject,
+    // WaitForSynchronizationObject, Escape, Unlock, and everything else: succeed and leave it at that.
+    return (NTSTATUS)0;
+}
+
 template <int N>
 static NTSTATUS APIENTRY ThunkWrapper(void* arg)
 {
-    NTSTATUS s = g_kmtForward ? g_thunks[N].real(arg) : (NTSTATUS)0xC00000BB; // STATUS_NOT_SUPPORTED
-    Log("  km %s(%p) = %08lx%s", g_thunks[N].name, arg, s, g_kmtForward ? "" : " [refused, not forwarded]");
+    NTSTATUS s;
+    const char* tag;
+    if (g_kmtForward) {
+        s   = g_thunks[N].real(arg);
+        tag = "";
+    } else if (g_kmtFake) {
+        s   = FakeKmt(g_thunks[N].name, arg);
+        tag = " [fake]";
+    } else {
+        s   = (NTSTATUS)0xC00000BB; // STATUS_NOT_SUPPORTED
+        tag = " [refused, not forwarded]";
+    }
+    Log("  km %s(%p) = %08lx%s", g_thunks[N].name, arg, s, tag);
     LogStack(g_thunks[N].name);
     return s;
 }
@@ -1413,34 +1600,55 @@ static FARPROC WINAPI Hook_GetProcAddress(HMODULE mod, LPCSTR name)
 // A sibling DLL the driver asks for by bare name is taken from the driver's own folder when it exists there.
 static HMODULE LoadSibling(const wchar_t* name, DWORD flags)
 {
-    const wchar_t* base = wcsrchr(name, L'\\');
-    base = base ? base + 1 : name;
-    wchar_t local[MAX_PATH];
-    swprintf_s(local, L"%s\\%s", g_driverDir, base);
-    HMODULE h = nullptr;
-    bool sibling = GetFileAttributesW(local) != INVALID_FILE_ATTRIBUTES;
-    if (sibling) h = LoadLibraryExW(local, nullptr, 0);
-    if (!h) h = LoadLibraryExW(name, nullptr, flags);
-    Log("  LoadLibrary(\"%ls\") = %p%s", name, (void*)h, sibling && h ? " [from the driver folder]" : "");
-    if (h && sibling) {
-        HookImports(h);
-        if (g_bpClear && _wcsicmp(base, L"atiumd6a.dll") == 0) {
-            Log("bp-clear: atiumd6a.dll at %p; arming clear write sites + caller gates", (void*)h);
-            // Clear write sites (the actual +0x64 writes): RVA = VA_preferred - 0x10000
-            ArmBp(h, 0x12EA32, "clear.A"); // path A write:  0x13EA32
-            ArmBp(h, 0x12E946, "clrzero"); // call site for memset(inner_obj,0,0x1000); cap r8=0 before the call
-            ArmBp(h, 0x0F44EC, "clear.B"); // path B write:  0x1044EC
-            ArmBp(h, 0x0F7305, "clear.1"); // new write:     0x107305
-            ArmBp(h, 0x1EBD09, "clear.2"); // new write:     0x1FBD09
-            ArmBp(h, 0x1FED70, "clear.3"); // new write:     0x20ED70
-            // Caller-level gates: do these functions even get called?
-            ArmBp(h, 0x12C950, "flush");   // state-flush function 0x13C950 (contains clear calls)
-            ArmBp(h, 0x12E260, "relobj");  // virtual call target that crashes at +0x31 ([rdi+8]=-1)
-            ArmBp(h, 0x0F4520, "tss.disp");// TSS dispatcher 0x104520 (path B caller)
-            ArmBp(h, 0x11A420, "gate");    // sub_12A420 (the gate condition for the clear)
-        }
+    // Null guard before any dereference
+    if (!name) {
+        Log("  LoadSibling: null name, skipping");
+        return nullptr;
     }
-    return h;
+    __try {
+    const wchar_t* base = wcsrchr(name, L'\\');
+        base = base ? base + 1 : name;
+        // Use WideCharToMultiByte for safe logging: avoids %ls crash on bad pointer
+        char safen[MAX_PATH * 2 + 4] = "(bad)";
+        char safeb[MAX_PATH * 2 + 4] = "(bad)";
+        WideCharToMultiByte(CP_ACP, 0, name, -1, safen, (int)sizeof safen, nullptr, nullptr);
+        WideCharToMultiByte(CP_ACP, 0, base, -1, safeb, (int)sizeof safeb, nullptr, nullptr);
+        char safedir[MAX_PATH * 2 + 4] = "(bad)";
+        WideCharToMultiByte(CP_ACP, 0, g_driverDir, -1, safedir, (int)sizeof safedir, nullptr, nullptr);
+        Log("  LoadSibling: name='%s' base='%s' driverDir='%s'", safen, safeb, g_driverDir[0] ? safedir : "(empty)");
+        wchar_t local[MAX_PATH];
+        HMODULE h = nullptr;
+        bool sibling = false;
+        if (g_driverDir[0] && base && base[0]) {
+        swprintf_s(local, L"%s\\%s", g_driverDir, base);
+            sibling = GetFileAttributesW(local) != INVALID_FILE_ATTRIBUTES;
+            if (sibling) h = LoadLibraryExW(local, nullptr, 0);
+        }
+        if (!h) h = LoadLibraryExW(name, nullptr, flags);
+    Log("  LoadLibrary(\"%s\") = %p%s", safen, (void*)h, sibling && h ? " [from the driver folder]" : "");
+        if (h && sibling) {
+            HookImports(h);
+            if (g_bpClear && _wcsicmp(base, L"atiumd6a.dll") == 0) {
+                Log("bp-clear: atiumd6a.dll at %p; arming clear write sites + caller gates", (void*)h);
+                // Clear write sites (the actual +0x64 writes): RVA = VA_preferred - 0x10000
+                ArmBp(h, 0x12EA32, "clear.A"); // path A write:  0x13EA32
+                ArmBp(h, 0x12E946, "clrzero"); // call site for memset(inner_obj,0,0x1000); cap r8=0 before the call
+                ArmBp(h, 0x0F44EC, "clear.B"); // path B write:  0x1044EC
+                ArmBp(h, 0x0F7305, "clear.1"); // new write:     0x107305
+                ArmBp(h, 0x1EBD09, "clear.2"); // new write:     0x1FBD09
+                ArmBp(h, 0x1FED70, "clear.3"); // new write:     0x20ED70
+                // Caller-level gates: do these functions even get called?
+                ArmBp(h, 0x12C950, "flush");   // state-flush function 0x13C950 (contains clear calls)
+                ArmBp(h, 0x12E260, "relobj");  // virtual call target that crashes at +0x31 ([rdi+8]=-1)
+                ArmBp(h, 0x0F4520, "tss.disp");// TSS dispatcher 0x104520 (path B caller)
+                ArmBp(h, 0x11A420, "gate");    // sub_12A420 (the gate condition for the clear)
+            }
+        }
+        return h;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("  LoadSibling: exception in body, loading original without sibling check");
+        return LoadLibraryExW(name, nullptr, flags);
+    }
 }
 
 static HMODULE WINAPI Hook_LoadLibraryW(LPCWSTR name) { return LoadSibling(name, 0); }
@@ -2296,18 +2504,17 @@ static size_t g_wlOk = 0, g_wlFailed = 0, g_wlMissing = 0;
 static bool g_wlDangle = false; // --workload-dangle: destroy a bound texture without unbinding it first
 static bool g_wlStaleDraw = false; // --workload-stale-draw: after destroy, issue another draw before the next bind
 static bool g_wlReset = false; // --workload-reset: between iterations, run the device-lost/Reset DDI sequence
+static int  g_passiveWatchSec = 0; // --passive-watch N: arm BPs on the already-loaded atiumd6a.dll, wait N seconds
 static bool g_hwTest = false;      // --hw-test: real-hardware fix verification (implies --kmt-forward --qai-forward
                                    // --bp-clear --device --workload --workload-dangle --workload-stale-draw).
                                    // PASS/FAIL is based on g_clearAHits rather than decoy writes.
                                    // Bug proof: expect hits > 0.  Fix proof (+ --workload-fix-unbind): expect 0.
 static bool g_wlFixUnbind = false; // --workload-fix-unbind: unbind all stages immediately before each DestroyResource,
                                    // modelling the fix applied to MPCVR and the built-in renderer.
-                                   // LIMITATION: does NOT suppress decoy hits when used with --bp-clear --fake-draw-params.
-                                   // The fake channel routes draws through s_fakeSb, a static block wired by the stateApply
-                                   // BP handler independently of the real driver state. pfnSetTexture(null) clears the real
-                                   // stage flag [stage+0x90] but not s_fakeSb, so the clear write fires regardless.
-                                   // Fix correctness is verified analytically: sub_13E8D0 checks [stage+0x90] before the
-                                   // write, and pfnSetTexture(null) zeroes it. Runtime proof requires real TeraScale hw.
+                                   // Runtime-verified via the fake channel: when the unbind ran, g_fakeSbSlotsEmpty
+                                   // (defined at the top of the file for the stateApply BP handler) suppresses the
+                                   // decoy wiring in stateApply, so the clear write no longer lands on a decoy and
+                                   // g_decoyHits stays 0.
 
 static void WlResult(const char* what, HRESULT hr)
 {
@@ -2509,6 +2716,7 @@ static void RunWorkload(HANDLE hDevice, D3DDDI_DEVICEFUNCS* df, size_t rounds)
     // Everything the fake runtime is tracking in the DEFAULT pool. The Reset step invalidates this set in
     // bulk; without --workload-reset it never holds more than the current round's texture.
     std::vector<HANDLE> tracked;
+    g_fakeSbSlotsEmpty = g_wlFixUnbind; // true when fix-unbind active, so the first stateApply routes to s_fakeDecoyNull
     for (size_t i = 0; i < rounds; i++) {
         HANDLE hTex = WlCreateTexture(hDevice, df, 0x50000 + i);
         if (hTex) tracked.push_back(hTex);
@@ -2517,6 +2725,7 @@ static void RunWorkload(HANDLE hDevice, D3DDDI_DEVICEFUNCS* df, size_t rounds)
             if (df->pfnSetTexture)
                 for (UINT s = 0; s < 8; s++) WlResult("SetTexture(stage N)", df->pfnSetTexture(hDevice, s, hTex));
             else WlMissing("SetTexture");
+            if (!g_wlFixUnbind) g_fakeSbSlotsEmpty = false;
         }
 
         WlTextureStageState(hDevice, df);
@@ -2537,8 +2746,10 @@ static void RunWorkload(HANDLE hDevice, D3DDDI_DEVICEFUNCS* df, size_t rounds)
             // bound so the next round's bind-and-draw sequence runs through the dangling pointer.
             if (!g_wlDangle && df->pfnSetTexture)
                 for (UINT s = 0; s < 8; s++) WlResult("SetTexture(N, unbind)", df->pfnSetTexture(hDevice, s, nullptr));
-            if (g_wlFixUnbind && df->pfnSetTexture)
+            if (g_wlFixUnbind && df->pfnSetTexture) {
                 for (UINT s = 0; s < 8; s++) WlResult("SetTexture(N, fix-unbind)", df->pfnSetTexture(hDevice, s, nullptr));
+                g_fakeSbSlotsEmpty = true;
+            }
             if (df->pfnDestroyResource) {
                 WlResult("DestroyResource", df->pfnDestroyResource(hDevice, hTex));
                 tracked.erase(std::find(tracked.begin(), tracked.end(), hTex));
@@ -2577,6 +2788,7 @@ static void RunWorkloadBatch(HANDLE hDevice, D3DDDI_DEVICEFUNCS* df, size_t batc
     };
     size_t created = 0, destroyed = 0;
     std::vector<HANDLE> tracked; // for the Reset step, as in the serial mode
+    g_fakeSbSlotsEmpty = g_wlFixUnbind; // true when fix-unbind active, so the first stateApply routes to s_fakeDecoyNull
     for (size_t r = 0; r < rounds; r++) {
         Log("  workload(batch): --- round %zu of %zu, holding %zu textures live ---", r + 1, rounds, batchSize);
         std::vector<HANDLE> live;
@@ -2589,6 +2801,7 @@ static void RunWorkloadBatch(HANDLE hDevice, D3DDDI_DEVICEFUNCS* df, size_t batc
             if (df->pfnSetTexture)
                 for (UINT s = 0; s < 8; s++) WlResult("SetTexture(stage N)", df->pfnSetTexture(hDevice, s, h));
             else WlMissing("SetTexture");
+            if (!g_wlFixUnbind) g_fakeSbSlotsEmpty = false;
             WlTextureStageState(hDevice, df);
             WlDrawTriangle(hDevice, df, verts);
         }
@@ -2607,8 +2820,10 @@ static void RunWorkloadBatch(HANDLE hDevice, D3DDDI_DEVICEFUNCS* df, size_t batc
 
         if (!g_wlDangle && df->pfnSetTexture)
             for (UINT s = 0; s < 8; s++) WlResult("SetTexture(N, unbind)", df->pfnSetTexture(hDevice, s, nullptr));
-        if (g_wlFixUnbind && df->pfnSetTexture)
+        if (g_wlFixUnbind && df->pfnSetTexture) {
             for (UINT s = 0; s < 8; s++) WlResult("SetTexture(N, fix-unbind)", df->pfnSetTexture(hDevice, s, nullptr));
+            g_fakeSbSlotsEmpty = true;
+        }
         for (HANDLE h : live) {
             if (df->pfnDestroyResource) {
                 WlResult("DestroyResource", df->pfnDestroyResource(hDevice, h));
@@ -2655,6 +2870,9 @@ static void TryCaps(const D3DDDI_ADAPTERFUNCS& f, HANDLE hDrv, const char* name,
     if (SUCCEEDED(hr)) HexDump(name, buf.data(), size, 64);
 }
 
+// The d3d9 shim build brings its own entry point; wmain stays for the exe and the injectable probe,
+// whose Legacy9Run calls it.
+#if !defined(D3D9SHIM_DLL)
 int wmain(int argc, wchar_t** argv)
 {
     const wchar_t* dll = nullptr;
@@ -2732,6 +2950,14 @@ int wmain(int argc, wchar_t** argv)
             }
         }
         else if (!wcscmp(argv[i], L"--kmt-forward")) g_kmtForward = true;
+        else if (!wcscmp(argv[i], L"--kmt-fake")) g_kmtFake = true;
+        else if (!wcscmp(argv[i], L"--passive-watch") && i + 1 < argc) {
+            // Arm clear BPs on the already-loaded atiumd6a.dll (injected into a live player), wait N
+            // seconds, then print the clear.A hit count. No fake device is created; MPCVR's own draws
+            // trigger the BPs. Useful for confirming the bug fires naturally from a Reset / format change.
+            g_passiveWatchSec = _wtoi(argv[++i]);
+            g_bpClear = true;
+        }
         else if (!wcscmp(argv[i], L"--hw-test")) {
             // Real-hardware fix verification. Implies everything needed to reach atiumd6a's clear path
             // via the native GPU draw pipeline. Use --workload-fix-unbind alongside to test the fix.
@@ -2794,8 +3020,8 @@ int wmain(int argc, wchar_t** argv)
 
     // Opened so it can be read while the probe is still running, which matters when the host is a long-lived
     // process such as the player.
-    if (g_logFile) { fclose(g_logFile); g_logFile = nullptr; }
-    g_logFile = _wfsopen(logPath, L"w", _SH_DENYWR);
+    if (g_logHandle != INVALID_HANDLE_VALUE) { CloseHandle(g_logHandle); g_logHandle = INVALID_HANDLE_VALUE; }
+    g_logHandle = CreateFileW(logPath, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     InitializeCriticalSection(&g_cs);
     g_procHeap = GetProcessHeap();
     AddVectoredExceptionHandler(1, CrashFilter);
@@ -2843,6 +3069,38 @@ int wmain(int argc, wchar_t** argv)
         // A detector that cannot see planted damage makes every later result meaningless, so the rounds are
         // skipped; the run still reports, so the failure is visible rather than silent.
         if (!selfTestPassed) { rc = 4; rounds = 0; }
+    }
+
+    if (g_passiveWatchSec > 0) {
+        // Passive-watch mode: arm BPs on atiumd6a.dll already in this process (MPCVR loaded it),
+        // wait for the player to trigger a Reset or format change, then report clear.A hits.
+        // No fake device is created; this is purely observational.
+        HMODULE aMod = LoadLibraryExW(full, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        if (aMod) HookImports(aMod);
+        HMODULE a6a = GetModuleHandleW(L"atiumd6a.dll");
+        if (a6a) {
+            Log("passive-watch: atiumd6a.dll at %p; arming clear write sites + caller gates", (void*)a6a);
+            ArmBp(a6a, 0x12EA32, "clear.A");
+            ArmBp(a6a, 0x12E946, "clrzero");
+            ArmBp(a6a, 0x0F44EC, "clear.B");
+            ArmBp(a6a, 0x0F7305, "clear.1");
+            ArmBp(a6a, 0x1EBD09, "clear.2");
+            ArmBp(a6a, 0x1FED70, "clear.3");
+            ArmBp(a6a, 0x12C950, "flush");
+            ArmBp(a6a, 0x12E260, "relobj");
+            ArmBp(a6a, 0x0F4520, "tss.disp");
+            ArmBp(a6a, 0x11A420, "gate");
+        } else {
+            Log("passive-watch: atiumd6a.dll not found in process; BPs not armed (player may not use this driver)");
+        }
+        Log("passive-watch: watching for %d seconds -- trigger a format change or seek in the player now",
+            g_passiveWatchSec);
+        Sleep((DWORD)(g_passiveWatchSec * 1000));
+        Log("SUMMARY: clear.A hits=%zu", g_clearAHits);
+        if (g_clearAHits > 0) Log("PROBE DONE (passive-watch: clear.A fired %zu times -- bug confirmed)", g_clearAHits);
+        else                  Log("PROBE DONE (passive-watch: clean -- no clear.A hits in %ds)", g_passiveWatchSec);
+        // (WriteFile is unbuffered; no fflush needed)
+        return rc;
     }
 
     if (rounds) Checkpoint("before load");
@@ -3053,7 +3311,7 @@ int wmain(int argc, wchar_t** argv)
                         } else {
                             Log("PROBE DONE");
                         }
-                        if (g_logFile) fflush(g_logFile);
+                        // (WriteFile is unbuffered; no fflush needed)
                     }
                     if (df->pfnDestroyDevice) {
                         HRESULT ddhr = df->pfnDestroyDevice(cd.hDevice);
@@ -3141,9 +3399,10 @@ int wmain(int argc, wchar_t** argv)
     }
 
     Log("PROBE DONE");
-    if (g_logFile) { fclose(g_logFile); g_logFile = nullptr; }
+    if (g_logHandle != INVALID_HANDLE_VALUE) { CloseHandle(g_logHandle); g_logHandle = INVALID_HANDLE_VALUE; }
     return rc;
 }
+#endif // !D3D9SHIM_DLL
 
 #ifdef LEGACY9_DLL
 // Built as a DLL as well, so the probe can run inside another process: there the driver's process heap really is
@@ -3176,11 +3435,11 @@ extern "C" __declspec(dllexport) DWORD WINAPI Legacy9Run(LPVOID)
     LPWSTR* argv = CommandLineToArgvW(cmd, &argc);
     if (!argv) return 1;
     // A log is opened before anything can fail, so a bad options line still leaves a trace in the host process.
-    if (!g_logFile) {
+    if (g_logHandle == INVALID_HANDLE_VALUE) {
         wchar_t path[MAX_PATH];
         GetModuleFileNameW(g_self, path, MAX_PATH);
         if (wchar_t* dot = wcsrchr(path, L'.')) wcscpy_s(dot, MAX_PATH - (dot - path), L"-startup.log");
-        g_logFile = _wfsopen(path, L"w", _SH_DENYWR);
+        g_logHandle = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         Log("Legacy9Run in pid %lu with options: %ls", GetCurrentProcessId(), cmd);
     }
     return (DWORD)wmain(argc, argv);

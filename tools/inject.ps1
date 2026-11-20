@@ -28,7 +28,13 @@ param(
     [string] $JsonPath,
     [int] $SettleSeconds = 10,
     [int] $RunSeconds = 30,
-    [switch] $KeepPlayer
+    [switch] $KeepPlayer,
+    # Create the named event MpcHcHarnessReady before starting the player so MPCVR's debug
+    # InitInternal waits; signal it after injection so device creation runs through the hooked driver.
+    [switch] $HarnessSync,
+    # Set MPC_HARNESS_UNBIND_FIX=1 in the child process so MPCVR's debug ReleaseVP/ReleaseDevice
+    # calls SetTexture(null) for stages 0-2 before releasing textures.
+    [switch] $HarnessUnbindFix
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
@@ -45,18 +51,35 @@ $line = "--dll `"$Dll`" --log `"$LogPath`" $ProbeArgs"
 if ($JsonPath) { $line += " --json `"$JsonPath`"" }
 Set-Content -LiteralPath (Join-Path $root 'build\legacy9hook.args') -Encoding UTF8 -Value $line
 
+$harnessEvent = $null
+if ($HarnessSync) {
+    $harnessEvent = [System.Threading.EventWaitHandle]::new($false,
+        [System.Threading.EventResetMode]::ManualReset, "MpcHcHarnessReady")
+}
+
+if ($HarnessUnbindFix) { $env:MPC_HARNESS_UNBIND_FIX = "1" }
+
 $started = $null
 if (-not $ProcessId) {
     if (-not $Player) { throw 'pass -ProcessId <pid> or -Player <path to mpc-hc64.exe>' }
     $argv = if ($Clip) { @("`"$Clip`"") } else { @() }
     $started = Start-Process -FilePath $Player -ArgumentList $argv -PassThru
     $ProcessId = $started.Id
-    Write-Host "started $Player as pid $ProcessId; settling for $SettleSeconds s so the menus are built"
-    Start-Sleep -Seconds $SettleSeconds
+    if ($HarnessSync) {
+        Write-Host "started $Player as pid $ProcessId; waiting for MPCVR InitInternal to pause on MpcHcHarnessReady"
+    } else {
+        Write-Host "started $Player as pid $ProcessId; settling for $SettleSeconds s so the menus are built"
+        Start-Sleep -Seconds $SettleSeconds
+    }
 }
 
 & $inject --pid $ProcessId --dll $hook
 if ($LASTEXITCODE) { throw "inject.exe failed ($LASTEXITCODE)" }
+
+if ($harnessEvent) {
+    $harnessEvent.Set()
+    Write-Host "harness event signalled — MPCVR D3D init proceeding through hooked driver"
+}
 
 # The log is opened for shared reading, so it can be followed while the probe is still running.
 $deadline = (Get-Date).AddSeconds($RunSeconds)
@@ -70,6 +93,9 @@ while ((Get-Date) -lt $deadline) {
     $sr.Close(); $fs.Close()
     if ($text -match 'PROBE DONE') { break }
 }
+if ($harnessEvent) { $harnessEvent.Close() }
+if ($HarnessUnbindFix) { Remove-Item Env:MPC_HARNESS_UNBIND_FIX -ErrorAction SilentlyContinue }
+
 if ($started -and -not $KeepPlayer) {
     [void]$started.CloseMainWindow()
     Start-Sleep 4
