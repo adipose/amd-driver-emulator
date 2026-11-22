@@ -1,4 +1,4 @@
-// legacy9: hosts a legacy D3D9 user-mode driver (the 2015 AMD atiumd64.dll) under a fake runtime, with the
+﻿// legacy9: hosts a legacy D3D9 user-mode driver (the 2015 AMD atiumd64.dll) under a fake runtime, with the
 // kernel side faked rather than forwarded, to answer questions the MPC-HC #4257 investigation left open:
 //
 //   1. Which heap does the driver allocate from, and does it put blocks in the 152-byte size class that the
@@ -31,17 +31,33 @@
 
 // ---------------------------------------------------------------- logging
 
-static FILE* g_logFile = nullptr;
+static HANDLE g_logHandle = INVALID_HANDLE_VALUE;
+static CRITICAL_SECTION g_logCs;
+static INIT_ONCE g_logCsOnce = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK LogCsInit(PINIT_ONCE, PVOID, PVOID*) { InitializeCriticalSection(&g_logCs); return TRUE; }
 
 static void Log(const char* fmt, ...)
 {
-    char buf[2048];
+    InitOnceExecuteOnce(&g_logCsOnce, LogCsInit, nullptr, nullptr);
+    char buf[2050];
+    int n = 0;
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(buf, sizeof buf, fmt, ap);
+    // Wrapped in __try: vsnprintf may crash on driver threads whose UCRT was never initialized.
+    // WriteFile avoids all UCRT thread state and cannot trigger a secondary exception in our VEH.
+    __try { n = vsnprintf(buf, (int)(sizeof(buf) - 2), fmt, ap); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { n = 0; }
     va_end(ap);
-    printf("%s\n", buf);
-    if (g_logFile) { fprintf(g_logFile, "%s\n", buf); fflush(g_logFile); }
+    if (n < 0 || n > (int)(sizeof(buf) - 2)) n = (int)(sizeof(buf) - 2);
+    buf[n] = '\n'; buf[n+1] = '\0';
+    EnterCriticalSection(&g_logCs);
+    __try {
+        if (g_logHandle != INVALID_HANDLE_VALUE) {
+            DWORD written;
+            WriteFile(g_logHandle, buf, (DWORD)(n + 1), &written, nullptr);
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    LeaveCriticalSection(&g_logCs);
 }
 
 static void HexDump(const char* label, const void* p, size_t n, size_t maxBytes = 96)
@@ -99,12 +115,45 @@ static void* s_fakeResourceVtbl[64]; // vtable for s_fakeResource: slot 7 = Stub
 static void* s_patchedSbVtbl[64];
 static bool  s_patchedSbVtblReady = false;
 static bool  s_fakeVtblFlushPatched = false;
+static void* s_realFlush = nullptr;    // resolved once from atiumd6a; vtable slot 4 when stages are bound
 static ULONG_PTR __stdcall StubRet0();
 static ULONG_PTR __stdcall StubRet1();
 static uint8_t s_fakeSb[0x2000];     // forward-declared for stateApply use
+static uint8_t s_fakeSb80[0x100];    // forward-declared for stateApply use; [s_fakeSb+0x80] sub-object
+static void*   s_fakeSb80Vtbl[32];   // vtable for s_fakeSb80: slot 4 = StubRet1
+static uint8_t s_fakeSb80Out[64];    // object s_fakeSb80's slot-23 stub fills into the caller's out-struct
+static uint8_t s_fakeSb110[256];     // zero-filled; wired at [s_fakeSb+0x110] so the 0x128680 epilogue
+                                     // destructor (0x257900 → 0x61BD0/0x64030) reads [+0x58]/[+0x60] as 0
 static uint8_t s_fakeResource[0x200]; // forward-declared for stateApply use
-static uint8_t s_fakeInner152[0x1200]; // forward-declared; large to cover 0x2B1B60 write range
+static uint8_t* s_fakeInner152 = nullptr; // allocated from g_innerHeap on first use; freed after DR0 arm so the write lands on freed memory
+static HANDLE   g_innerHeap = nullptr;    // private heap: freed pages stay mapped, so driver write completes without AV
+static uint8_t s_fakeDecoyNull[256];   // safe write target when fix-unbind active: not a registered decoy
 static uint8_t s_fakeChan10[128];      // forward-declared; two-level fake for [channel+0x10]
+// When a real texture resource is about to be freed (IFakeD3DTexture9::Release) while still
+// bound to a stage, the shim stores its inner pointer ([hRes+0x48]) here; the stateApply BP
+// then arms a DR0 write watchpoint on inner+0x64 so the driver's own write-after-free is caught.
+static void* g_wpInnerPtr = nullptr;
+// Two-phase injection state: reset by defer.run each deferred flush; incremented by the
+// stateApply SNAP INJECT. 0 = pre-BIND, 1 = BIND in flight (driver updates RSI[+0x88]),
+// 2+ = post-BIND (UNBIND injection: new snapshot slot left null to trigger the CLEAR path).
+static int s_phase = 0;
+// Stop flag: set when clear.A fires so the UNBIND injection stops re-arming the
+// stage record and the BIND/UNBIND loop terminates instead of cycling forever.
+static bool s_clearFired = false;
+static uint8_t s_nullRes[64] = {};   // non-null sentinel for UNBIND fn_1850 main path
+static void*   s_vtblObj = nullptr;  // vtable caller obj saved at BIND for state injection
+// Zeroed stand-in for the per-resource backing object the deep flush writes into.
+// atiumd64:0x51D80 (called from atiumd6a:0x1D30 with rcx=[channel+0x188]) does
+// mov rax,[rcx+0x10]; mov [rax+0x1A4],r13d; mov [rax+0x1A8],r13d -- when the ret244a
+// BIND injection put hRes into the slot, [hRes+0x10] is null (the driver never
+// allocated backing for the emulated resource) and the write AVs at address 0x1A4.
+// [slot+0x10] is also chained by the stateApply gate (atiumd64:0x2FF90): rbp=slot's
+// backing, rax=[backing+0x600], rcx=[rax+0x20] must both be non-null.  The real
+// device_inner (captured at stateApply) satisfies both uses; s_resBacking with its
+// +0x600 wired to the real holder is the fallback.
+static uint8_t s_resBacking[0x1000];
+static void*   s_realDevInner = nullptr;  // device_inner captured at stateApply (rcx, when [rcx+0x600] chain is live)
+static void*   s_realHolder   = nullptr;  // [device_inner+0x600] captured with it
 
 #include "../lib/veh_bp.h"
 
@@ -125,10 +174,15 @@ static void LogFramesFrom(CONTEXT* c, int frames)
     }
 }
 
+#ifdef D3D9SHIM_DLL
+#include "legacy9_pool.cpp"
+#endif
+
 static void OnBp(EXCEPTION_POINTERS* ep)
 {
     uintptr_t at = (uintptr_t)ep->ExceptionRecord->ExceptionAddress;
-    for (auto& b : g_bps) {
+    for (size_t i = 0; i < g_bpsCount; i++) {
+        Bp& b = g_bps[i];
         if (b.addr != at) continue;
         DWORD old;
         VirtualProtect((void*)at, 1, PAGE_EXECUTE_READWRITE, &old);
@@ -141,88 +195,275 @@ static void OnBp(EXCEPTION_POINTERS* ep)
         Log("  bp %-24s rcx=%p rdx=%p r8=%p r9=%p", b.tag, (void*)ep->ContextRecord->Rcx,
             (void*)ep->ContextRecord->Rdx, (void*)ep->ContextRecord->R8, (void*)ep->ContextRecord->R9);
         if (!strcmp(b.tag, "stateApply")) {
-            // rdx = hDevice+0x4900; the flush path takes its two draw-param structs from +0x58/+0x60.
-            // Confirm they still hold the --fake-draw-params buffers and that the fields the resolver
-            // dereferences survived whatever ran between CreateDevice and this draw.
+            // Observational only: the driver owns the channel, the draw-param structs and the
+            // state snapshots; nothing here may substitute its own objects for them.  Log the
+            // real objects and, when a texture was released while still bound (g_wpInnerPtr,
+            // captured by the shim from the released resource's [hRes+0x48]), arm a DR0 write
+            // watchpoint on inner+0x64 through the exception context so the driver's own
+            // write-after-free is caught by the hardware.
+            static int s_stateApplyCount = 0;
+            s_stateApplyCount++;
             void* s = (void*)ep->ContextRecord->Rdx;
             __try {
                 void* rbp = *(void**)((char*)s + 0x58);
                 void* r14 = *(void**)((char*)s + 0x60);
-                Log("       stateApply: [rdx+0x58]=%p [rdx+0x60]=%p", rbp, r14);
-                if (rbp)
-                    Log("       stateApply: rbp[0x40]=%p rbp[0x1B8]=%p", *(void**)((char*)rbp + 0x40),
-                        *(void**)((char*)rbp + 0x1B8));
-                if (r14)
-                    Log("       stateApply: r14[0x40]=%p r14[0x1B8]=%p", *(void**)((char*)r14 + 0x40),
-                        *(void**)((char*)r14 + 0x1B8));
                 // The atiumd64 gate at 0x2FF90 calls atiumd6a:0x2180 only when both rax=[atiumd64+0x7F45C0]
                 // and rcx=[[device_inner+0x600]+0x20] are non-null; dump that chain (rcx=device_inner here).
                 void* inner = (void*)ep->ContextRecord->Rcx;
                 void* p600 = *(void**)((char*)inner + 0x600);
                 void* chan  = p600 ? *(void**)((char*)p600 + 0x20) : nullptr;
-                Log("       stateApply: [inner+0x600]=%p [+0x20]=%p", p600, chan);
-                // Verify state_block vtable at the moment stateApply fires.
-                // If the vtable is null (state block was freed/reallocated during workload),
-                // re-scan [inner + 0..0x800] for the current state block and re-wire.
-                if (chan && s_fakeChannel && chan == s_fakeChannel) {
-                    void* sb    = *(void**)((char*)chan + 0x28);
-                    void* svtbl = sb ? *(void**)sb : nullptr;
-                    Log("       stateApply: [chan+0x28]=%p vtbl=%p", sb, svtbl);
-                    if (sb) {
-                        void* tex0 = nullptr, *tex1 = nullptr;
-                        __try { tex0 = *(void**)((char*)sb + 0x88); } __except(1) {}
-                        __try { tex1 = *(void**)((char*)sb + 0x98); } __except(1) {}
-                        Log("       stateApply: sb[+0x88]=%p sb[+0x98]=%p (texture slots)", tex0, tex1);
-                    }
-                    // Wire s_fakeSb (all zeros) with the real flush at vtable[4].
-                    // Using the real state block causes stale-pointer crashes inside the flush;
-                    // s_fakeSb gives NULL at all data fields (crash addresses ≈ 0+offset, easy
-                    // to identify and stub).  vtable[4] must be the real 0x13C950 flush so the
-                    // flush BP fires; other gates (vtable[7],[10],[12]) are already set in
-                    // s_fakeStateVtbl; slot 5 (0x13E260) is StubRet0 to skip the base-vtable crash.
-                    if (!s_fakeVtblFlushPatched) {
-                        HMODULE a6a = GetModuleHandleA("atiumd6a.dll");
-                        if (a6a) {
-                            s_fakeStateVtbl[4] = (char*)a6a + (0x13C950 - 0x10000);
-                            s_fakeStateVtbl[5] = (void*)StubRet0; // 0x13E260 → skip base-vtable crash
-                            s_fakeVtblFlushPatched = true;
-                            Log("       stateApply: s_fakeStateVtbl[4]=real flush %p, [5]=StubRet0", s_fakeStateVtbl[4]);
+                Log("       stateApply(#%d): drawparams %p %p  [inner+0x600]=%p channel=%p",
+                    s_stateApplyCount, rbp, r14, p600, chan);
+#ifdef D3D9SHIM_DLL
+                // Capture the real device_inner/holder pair the first time the gate runs
+                // with a live chain; st.call20 installs it as [hRes+0x10] so the same gate
+                // keeps working after the BIND injection puts our resource in the slot.
+                if (p600 && chan && inner != (void*)s_resBacking &&
+                    inner != s_realDevInner && (uintptr_t)inner > 0x10000) {
+                    s_realDevInner = inner;
+                    s_realHolder = p600;
+                    if (!*(void**)(s_resBacking + 0x600))
+                        *(void**)(s_resBacking + 0x600) = p600;
+                    Log("       stateApply: captured device_inner=%p holder=%p (for [hRes+0x10] install)",
+                        inner, p600);
+                    // The old-resource clear (fn_1850 -> atiumd64:0x53180 -> 0x596D0) runs
+                    // rcx=device_inner and calls [device_inner+0xD8] when [hRes+0x10]!=0,
+                    // gated on [[device_inner]+4] >= 0x3002.  Dump that chain once.
+                    __try {
+                        void* vt = *(void**)inner;
+                        unsigned ver = vt ? *(unsigned*)((char*)vt + 4) : 0;
+                        void* p8 = *(void**)((char*)inner + 8);
+                        void* pd8 = *(void**)((char*)inner + 0xD8);
+                        char w1[300], w2[300];
+                        Log("       stateApply: device_inner vtbl=%p [vtbl+4]=%08x [+8]=%p [+0xD8]=%s",
+                            vt, ver, p8, pd8 ? Where(pd8, w1, sizeof w1) : "(null)");
+                        (void)w2;
+                        // One-shot version-gate bypass: the clear path at atiumd64:0x53180
+                        // requires [[device_inner]+4] >= 0x3002, but the adapter settings
+                        // block carries 0xC00 here.  Patch it once so clear.A can fire.
+                        static bool s_vtblVerPatched = false;
+                        if (vt && ver < 0x3002 && !s_vtblVerPatched) {
+                            *(unsigned*)((char*)vt + 4) = 0x3002;
+                            s_vtblVerPatched = true;
+                            Log("       stateApply: PATCHED [vtbl+4] 0x%08x -> 0x3002 (version gate bypass)", ver);
                         }
-                    }
-                    // s_fakeSb must be fully re-zeroed on each wiring so vtable changes
-                    // from previous draws don't accumulate, then re-populate the fields we need.
-                    memset(s_fakeSb, 0, sizeof s_fakeSb);
-                    *(void**)s_fakeSb = s_fakeStateVtbl;
-                    // Populate texture slots so the bound-resource selector 0x4BFA0 doesn't
-                    // crash reading [null+0xB0].  Set every 8-byte slot from +0x28 to +0x140
-                    // (excluding +0x20=stage_index which stays 0, and +0xA0/+0xA2 gate flags).
-                    // Fill only pointer-sized slots (0x28..0xBF).  Fields at 0xC0+ are mostly
-                    // DWORD integers (texture-stage counts): leave them 0 (from memset above).
-                    for (int _off = 0x28; _off <= 0xBF; _off += 8)
-                        *(void**)(s_fakeSb + _off) = s_fakeResource;
-                    *(void**)(s_fakeSb + 0xA0) = nullptr;  // gate: [+0xA2] must stay 0
-                    *(void**)(s_fakeChannel + 0x28) = s_fakeSb;
-                    // Route s_fakeResource[+0x48] → first decoy block so sub_13E8D0's
-                    // "mov rbx,[rax+0x48]" gives rbx=decoy → clear write targets the decoy.
-                    // The clrzero BP caps r8=0 to prevent the preceding 4 KB memset from
-                    // overflowing the 152-byte block; individual field writes stay in bounds.
-                    if (!g_decoys.empty()) {
-                        *(ULONG_PTR**)(s_fakeResource + 0x48) = g_decoys[0].block;
-                        Log("       stateApply: s_fakeResource[+0x48] → decoy[0] %p", g_decoys[0].block);
-                    }
-                    Log("       stateApply: wired s_fakeSb (real flush@[4], tex slots → s_fakeResource)");
+                    } __except (EXCEPTION_EXECUTE_HANDLER) { Log("       stateApply: devinner dump fault"); }
                 }
+#endif
+                if (rbp) {
+                    void* snap = *(void**)((char*)rbp + 0x1B8);
+                    Log("       stateApply: rbp snapshot=%p slots [+0x88]=%p [+0x98]=%p [+0x1A0]=%x", snap,
+                        snap ? *(void**)((char*)snap + 0x88) : nullptr,
+                        snap ? *(void**)((char*)snap + 0x98) : nullptr,
+                        snap ? *(unsigned*)((char*)snap + 0x1A0) : 0);
+                    static int s_snapDumped = 0;
+                    if (snap && s_snapDumped < 4) {
+                        s_snapDumped++;
+                        HexDump("snap", snap, 0x60, 0x60);
+                        HexDump("snap+0x1a00", (char*)snap + 0x1A00, 0x80, 0x80);
+                    }
+                }
+                if (chan) {
+                    void* sb = *(void**)((char*)chan + 0x28);
+                    Log("       stateApply: [chan+0x28]=%p vtbl=%p", sb, sb ? *(void**)sb : nullptr);
+                }
+#ifdef D3D9SHIM_DLL
+                // Use the draw-committed snapshot (captured at DrawPrimitive time, before MPCVR
+                // unbinds textures before Present). g_shimBoundCount is 0 by the time the deferred
+                // flush fires stateApply; g_drawCommittedCount preserves the state from draw time.
+                Log("       stateApply: D3D9SHIM block liveCount=%d committedCount=%d r14=%p",
+                    g_shimBoundCount, g_drawCommittedCount, r14);
+                // Inject texture binding into the r14 (new-state) snapshot so
+                // atiumd6a:0x2180 passes the CMP [snapshot+0x1A0],0 check at RVA 0x241A
+                // and reaches the flush path instead of branching to the skip at 0x24EF.
+                // snapshot = *(r14+0x1B8); r14 is the second draw-params from s+0x60.
+                void* r14_snap = nullptr;
+                __try { r14_snap = r14 ? *(void**)((char*)r14 + 0x1B8) : nullptr; }
+                __except (EXCEPTION_EXECUTE_HANDLER) {}
+                // Steady-state gate fix: during playback the recorder never rebuilds the
+                // snapshots -- the stateApply gate at 0x30334 checks [rbp+0x1B8]!=0 and the
+                // gate fn 0x2FF90 then checks [r14+0x1B8]!=0, and after one forced flush the
+                // driver epilogue clears the r14 link so the gate never fires again
+                // (2155/2158 stateApplies skipped in a 25s MPCVR run).  Cross-link both
+                // draw-params to whichever snapshot is live so the flush runs every cycle.
+                if (rbp && r14 && g_drawCommittedCount > 0 && !s_clearFired) {
+                    void* rbp_snap = nullptr;
+                    __try { rbp_snap = *(void**)((char*)rbp + 0x1B8); }
+                    __except (EXCEPTION_EXECUTE_HANDLER) {}
+                    static int s_linkLog = 0;
+                    if (!rbp_snap && r14_snap) {
+                        __try {
+                            *(void**)((char*)rbp + 0x1B8) = r14_snap;
+                            if (s_linkLog < 8) { s_linkLog++;
+                                Log("       stateApply: linked [rbp+0x1B8]=%p (was null) -- forcing flush gate",
+                                    r14_snap); }
+                        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                    } else if (rbp_snap && !r14_snap) {
+                        __try {
+                            *(void**)((char*)r14 + 0x1B8) = rbp_snap;
+                            r14_snap = rbp_snap;
+                            if (s_linkLog < 8) { s_linkLog++;
+                                Log("       stateApply: linked [r14+0x1B8]=%p (was null) -- forcing flush gate",
+                                    rbp_snap); }
+                        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                    }
+                }
+                if (r14_snap && s_clearFired) {
+                    Log("       stateApply: clear already fired - skipping SNAP INJECT (loop stop)");
+                } else if (r14_snap) {
+                    __try {
+                        // The flush's stage-0 resource has two sources:
+                        //   BIND phase: the shim-committed binding g_shimStageHRes[0].
+                        //     g_drvBoundHRes[0] cannot be used here -- it is only recorded
+                        //     after pfnSetTexture returns, but the first flush (and this
+                        //     handler) runs INSIDE that call, so keying BIND on it meant
+                        //     bindPhase was always false, the BIND inject never fired, and
+                        //     the driver never allocated the inner object.
+                        //   UNBIND phase: the driver-side applied binding g_drvBoundHRes[0]
+                        //     (a texture the driver still references even after the shim
+                        //     released it -- exactly the #4257 condition).
+                        HANDLE shimH0 = g_shimStageHRes[0];
+                        HANDLE drvH0  = g_drvBoundHRes[0];
+                        bool bindPhase = (s_phase == 0 && shimH0 != nullptr);
+                        HANDLE injectH0 = bindPhase ? shimH0 : drvH0;
+                        // Always inject the &g_stageRec POINTER (not a count!) so the
+                        // CMP [snap+0x1A0],0 at 0x241A passes.  res0/res1 are what the
+                        // driver reads at st.baa5 ([RBX+0x08]) as the NEW resource: hRes
+                        // only in the BIND phase, null in UNBIND so the 0x244A vtable
+                        // call takes the CLEAR path instead of re-BINDing.
+                        g_stageRec.pad0 = nullptr;
+                        g_stageRec.res0 = bindPhase ? injectH0 : (HANDLE)s_nullRes;
+                        g_stageRec.res1 = injectH0 ? injectH0 : (HANDLE)s_nullRes;  // applied binding - OLD resource for CLEAR path
+                        *(void**)((char*)r14_snap + 0x1A0) = (void*)&g_stageRec;
+                        if (s_phase == 0 && injectH0) {
+                            // Phase 1 BIND: inject hRes so the driver binds stage 0
+                            *(void**)((char*)r14_snap + 0x88) = (void*)injectH0;
+                            Log("       stateApply: BIND INJECT (phase 1) r14_snap=%p [+0x88]=%p [+0x1A0]=&stageRec",
+                                r14_snap, injectH0);
+                            // Inject [hRes+8]=hRes (self-ref, non-null) and [hRes+16]=1 so fn_1850 takes the main path.
+                            void* hResPtr = (void*)injectH0;
+                            // If hRes is already fenced (released-while-bound, pump path),
+                            // do NOT touch it at all: the driver's own deref of the fenced
+                            // page is the FENCE UAF detection, and a shim-side touch would
+                            // either fault here or (worse) get the page disarmed first.
+                            bool hResFenced = false;
+                            if (hResPtr) {
+                                uintptr_t _pg = (uintptr_t)hResPtr & ~(uintptr_t)0xFFF;
+                                PoolLock();
+                                for (int _i = 0; _i < g_fencedCount; _i++)
+                                    if (!g_fenced[_i].triggered &&
+                                        (uintptr_t)g_fenced[_i].page_base == _pg) { hResFenced = true; break; }
+                                PoolUnlock();
+                            }
+                            if (hResPtr && hResFenced) {
+                                Log("       stateApply: BIND - hRes=%p page FENCED, skipping self-ref patch (UAF trigger live)", hResPtr);
+                            } else if (hResPtr) {
+                                __try {
+                                    // Do not clobber a FENCE-UAF bait pointer planted by the
+                                    // shim's Release at [hRes+8]: fn_1850 passes [hRes+8] to the
+                                    // clear dispatch, and clr.inner dereferences it -- the bait
+                                    // is a PAGE_NOACCESS page whose touch is the detection.
+                                    void* cur8 = *(void**)((char*)hResPtr + 8);
+                                    bool isBait = false;
+                                    PoolLock();
+                                    for (int _i = 0; _i < g_fencedCount; _i++)
+                                        if (g_fenced[_i].page_base == cur8) { isBait = true; break; }
+                                    PoolUnlock();
+                                    if (!isBait) {
+                                        *(ULONG_PTR*)((char*)hResPtr + 8)  = (ULONG_PTR)hResPtr;
+                                        Log("       stateApply: BIND - patched hRes[+8]=self hRes[+16]=1 at %p", hResPtr);
+                                    } else {
+                                        static int s_baitKept = 0;
+                                        if (s_baitKept < 6) { s_baitKept++;
+                                            Log("       stateApply: BIND - hRes[+8]=%p is bait, NOT patching to self at %p", cur8, hResPtr); }
+                                    }
+                                    *(DWORD*)((char*)hResPtr + 16) = 1;
+                                } __except(EXCEPTION_EXECUTE_HANDLER) { Log("       stateApply: hRes patch fault"); }
+                            }
+                            // The driver has now applied this binding: record it so later
+                            // UNBIND phases inject what the *driver* still references, even
+                            // if the shim has since released it (the #4257 window).
+                            g_drvBoundHRes[0] = injectH0;
+                            Log("       stateApply: BIND applied - g_drvBoundHRes[0]=%p", injectH0);
+                        } else {
+                            // Phase 2+ UNBIND: explicitly null [+0x88] (the BIND phase set it to hRes; must clear it
+                            // so the driver sees new=null and triggers the CLEAR path, not another BIND).
+                            *(void**)((char*)r14_snap + 0x88) = nullptr;
+                            Log("       stateApply: UNBIND INJECT (phase %d) r14_snap=%p [+0x88]=null(cleared) [+0x1A0]=&stageRec",
+                                s_phase, r14_snap);
+                            // Unbind applied: the driver no longer references the stage-0
+                            // resource after this flush.
+                            g_drvBoundHRes[0] = nullptr;
+                        }
+                        s_phase++;
+                    } __except (EXCEPTION_EXECUTE_HANDLER) { Log("       stateApply: SNAP INJECT fault"); }
+                }
+                // Arm DR0 on the released texture's real inner object, when one has been captured
+                // and not armed yet.  Writing Dr0/Dr7 into the exception context is what arms it:
+                // the OS restores the context when OnBp returns.  (RtlCaptureContext /
+                // SetThreadContext deadlock from this path.)
+                static void* s_wpArmedFor[4] = {};
+                static int s_wpSlots = 0;
+                if (g_wpInnerPtr && s_wpSlots < 4) {
+                    bool seen = false;
+                    for (int i = 0; i < s_wpSlots; i++) if (s_wpArmedFor[i] == g_wpInnerPtr) seen = true;
+                    if (!seen) {
+                        uintptr_t wpAddr = (uintptr_t)g_wpInnerPtr + 0x64;
+                        SetDrSlot(ep->ContextRecord, s_wpSlots, wpAddr);
+                        InitOnceExecuteOnce(&g_hwWpCsOnce, HwWpCsInit, nullptr, nullptr);
+                        g_hwWp[s_wpSlots] = HwWp{ wpAddr, g_wpInnerPtr, true };
+                        Log("       stateApply: armed DR%d write WP on REAL freed inner %p+0x64 "
+                            "(from m_hRes+0x48 of a texture released while bound)",
+                            s_wpSlots, g_wpInnerPtr);
+                        s_wpArmedFor[s_wpSlots++] = g_wpInnerPtr;
+                    }
+                }
+#endif
             } __except (EXCEPTION_EXECUTE_HANDLER) { Log("       (read fault)"); }
         } else if (!strcmp(b.tag, "flush")) {
-            // r9 → rbx: flush calls selector(rbx) on the "current bound texture"; real freed
-            // textures have null vtables at their sub-object slots → crash.  Replace with fake.
-            ep->ContextRecord->R9 = (ULONG_PTR)s_fakeResource;
-            Log("       flush: replaced r9 with s_fakeResource %p", s_fakeResource);
+            // Count the real flush: entry of atiumd6a's state-flush function with the driver's own
+            // state.  rcx = the [channel+0x28] object, rdx = channel, r8/r9 = old/new snapshots.
+            static size_t s_flushCount = 0;
+            s_flushCount++;
+            __try {
+                void* chan = (void*)ep->ContextRecord->Rdx;
+                void* newsnap = (void*)ep->ContextRecord->R9;
+                void* slot0 = newsnap ? *(void**)((char*)newsnap + 0x88) : nullptr;
+                void* res48 = slot0 ? *(void**)((char*)slot0 + 0x48) : nullptr;
+                Log("       flush(#%zu): this=%p chan=%p old=%p new=%p  new[+0x88]=%p [res+0x48]=%p",
+                    s_flushCount, (void*)ep->ContextRecord->Rcx, chan,
+                    (void*)ep->ContextRecord->R8, newsnap, slot0, res48);
+                if (slot0 && !res48) {
+                    // hRes[+0x48] still null -- scan hRes for the first live pointer to find real offset.
+                    for (int _off = 0x40; _off <= 0x100; _off += 8) {
+                        void* v = nullptr;
+                        __try { v = *(void**)((char*)slot0 + _off); } __except(EXCEPTION_EXECUTE_HANDLER) {}
+                        if (v && (uintptr_t)v > 0x10000)
+                            Log("       flush hRes scan: hRes[+0x%x]=%p (non-null)", _off, v);
+                    }
+                }
+                if (res48 && (uintptr_t)res48 > 0x10000) {
+                    Log("       flush: hRes[+0x48]=%p IS non-null -- capturing as g_wpInnerPtr", res48);
+                    g_wpInnerPtr = res48;
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) { Log("       flush: (read fault)"); }
         } else if (!strcmp(b.tag, "clrzero")) {
-            // BP at the call site 13e946 (call 0x2B1B60) in sub_13E8D0.
-            // rcx=rbx=inner_obj, r8=0x1000.  Cap r8=0 → memset returns immediately (r8<8 path).
-            ep->ContextRecord->R8 = 0;
-            Log("       clrzero: capped r8=0, inner_obj=%p", (void*)ep->ContextRecord->Rcx);
+            // Skip the CALL instruction entirely (race-free alternative to capping r8).
+            // The clrzero BP is at a 5-byte CALL rel32 (original byte 0xe8); skipping it
+            // prevents both this thread and any other thread from running the uncapped
+            // memset(inner_obj, 0, 0x1000) that would overflow the 152-byte block.
+            // Re-arm the BP immediately (we un-armed it above at line 158) so other threads
+            // that reach this call site also skip it, closing the race window.
+            {
+                DWORD ra_old;
+                VirtualProtect((void*)at, 1, PAGE_EXECUTE_READWRITE, &ra_old);
+                *(unsigned char*)at = 0xCC;    // re-arm immediately
+                VirtualProtect((void*)at, 1, ra_old, &ra_old);
+            }
+            ep->ContextRecord->Rip = at + 5;   // advance past the 5-byte call instruction
+            ep->ContextRecord->EFlags &= ~0x100u;  // cancel single-step (no re-arm needed)
+            g_rearm = 0;
+            Log("       clrzero: skipped call (race-free), inner_obj=%p", (void*)ep->ContextRecord->Rcx);
         } else if (!strcmp(b.tag, "acquire")) {
             void* ctx = (void*)ep->ContextRecord->Rcx;
             __try {
@@ -230,6 +471,519 @@ static void OnBp(EXCEPTION_POINTERS* ep)
                     (unsigned long)ep->ContextRecord->Rdx, *(void**)ctx, *(unsigned*)((char*)ctx + 8),
                     *(void**)((char*)ctx + 0x10));
             } __except (EXCEPTION_EXECUTE_HANDLER) { Log("       (read fault)"); }
+        } else if (!strcmp(b.tag, "mmdev.done")) {
+            // At atiumd64+0x1E9C8: rax = result of atiumd6a:0x9430 call, stored to [rbx+0x5028].
+            Log("       mmdev.done: [settings+0x5028] <- rax=%p (settings=%p)",
+                (void*)ep->ContextRecord->Rax, (void*)ep->ContextRecord->Rbx);
+        } else if (!strcmp(b.tag, "mmobj.make")) {
+            // atiumd6a:0x9430(rcx?, rdx=settings+0x20, r8=settings+0x5030)
+            Log("       mmobj.make: rdx=%p r8=%p", (void*)ep->ContextRecord->Rdx,
+                (void*)ep->ContextRecord->R8);
+        } else if (!strcmp(b.tag, "chan.make")) {
+            // atiumd6a:0x3710(rcx=holder, rdx=[settings+0x5028])
+            Log("       chan.make: holder=%p [settings+0x5028]=%p",
+                (void*)ep->ContextRecord->Rcx, (void*)ep->ContextRecord->Rdx);
+        } else if (!strcmp(b.tag, "mmdev.make")) {
+            Log("       mmdev.make: settings=%p", (void*)ep->ContextRecord->Rcx);
+        } else if (!strcmp(b.tag, "holder.make")) {
+            Log("       holder.make: dev_inner=%p", (void*)ep->ContextRecord->Rcx);
+        } else if (!strcmp(b.tag, "mmdev.free")) {
+            Log("       mmdev.free: settings=%p [+0x5028]=%p", (void*)ep->ContextRecord->Rcx,
+                (void*)ep->ContextRecord->Rcx);
+        } else if (!strcmp(b.tag, "mmobj.init")) {
+            // At atiumd6a+0x9482: eax = init() result; 1 means the object is kept.
+            Log("       mmobj.init: init returned %d (rbx=%p)",
+                (int)ep->ContextRecord->Rax, (void*)ep->ContextRecord->Rbx);
+        } else if (!strcmp(b.tag, "init.ok") || !strcmp(b.tag, "init.fail")) {
+            Log("       %s: rbp+0x20=%x rbp+0x30=%x", b.tag,
+                *(unsigned*)(ep->ContextRecord->Rbp + 0x20),
+                *(unsigned*)(ep->ContextRecord->Rbp + 0x30));
+        } else if (!strncmp(b.tag, "init.", 5)) {
+            Log("       %s: eax=%llx rbx=%p rdi=%p rsi=%p", b.tag,
+                (unsigned long long)ep->ContextRecord->Rax, (void*)ep->ContextRecord->Rbx,
+                (void*)ep->ContextRecord->Rdi, (void*)ep->ContextRecord->Rsi);
+        } else if (!strncmp(b.tag, "q370.", 5)) {
+            Log("       %s: eax=%llx rbx=%p rdi=%p", b.tag,
+                (unsigned long long)ep->ContextRecord->Rax, (void*)ep->ContextRecord->Rbx,
+                (void*)ep->ContextRecord->Rdi);
+        } else if (!strncmp(b.tag, "s80.", 4)) {
+            Log("       %s: eax=%llx rbx=%p rdi=%p rsi=%p", b.tag,
+                (unsigned long long)ep->ContextRecord->Rax, (void*)ep->ContextRecord->Rbx,
+                (void*)ep->ContextRecord->Rdi, (void*)ep->ContextRecord->Rsi);
+        } else if (!strncmp(b.tag, "q7b.", 4)) {
+            Log("       %s: eax=%llx rbx=%p ebp=%p rsi=%p rdi=%p", b.tag,
+                (unsigned long long)ep->ContextRecord->Rax, (void*)ep->ContextRecord->Rbx,
+                (void*)ep->ContextRecord->Rbp, (void*)ep->ContextRecord->Rsi,
+                (void*)ep->ContextRecord->Rdi);
+        } else if (!strcmp(b.tag, "cap.read")) {
+            // 0x85370(rcx=obj80, rdx=&count, r8d=engine id, r9=&out1): logs the engine id the
+            // driver wants from atiumd6a.cap.
+            Log("       cap.read: engine id=%x rdx=%p r9=%p", (unsigned)ep->ContextRecord->R8,
+                (void*)ep->ContextRecord->Rdx, (void*)ep->ContextRecord->R9);
+        } else if (!strcmp(b.tag, "draw.pipe")) {
+            // 0x35470: the immediate draw path.  It early-outs unless [hDev+0xE10] and
+            // [hDev+0x1C90] are non-null; log them plus the deferred-batch count and the
+            // 0x100000 gate bit the deferred flush (0x2DE40) requires.
+            __try {
+                void* d = (void*)ep->ContextRecord->Rcx;
+                void* hRes1c90 = *(void**)((char*)d + 0x1C90);
+                int dcnt = *(int*)((char*)d + 0x47B0);
+                unsigned gate = *(unsigned*)((char*)d + 0x18);
+                Log("       draw.pipe: hDev=%p [+0xE10]=%p [+0x1C90]=%p [+0x47B0]=%d [+0x18]=%08x type=%lu count=%lu",
+                    d, *(void**)((char*)d + 0xE10), hRes1c90,
+                    dcnt, gate,
+                    (unsigned long)ep->ContextRecord->Rdx,
+                    (unsigned long)ep->ContextRecord->R8);
+                // Stale-reference probe: if the texture handle the device still holds at
+                // [+0x1C90] was released, its inner page ([hRes+0x48]) is PAGE_NOACCESS.
+                if (hRes1c90) {
+                    void* inner = *(void**)((char*)hRes1c90 + 0x48);
+                    if (inner) {
+                        MEMORY_BASIC_INFORMATION mbi;
+                        if (VirtualQuery(inner, &mbi, sizeof mbi) &&
+                            (mbi.State == MEM_FREE || mbi.Protect == PAGE_NOACCESS)) {
+                            Log("       STALE REF detected hRes=%p inner=%p (%s)",
+                                hRes1c90, inner,
+                                mbi.State == MEM_FREE ? "MEM_FREE" : "PAGE_NOACCESS");
+                        }
+                    }
+                }
+                // Force the deferred flush: nonzero deferred-batch count + the 0x100000
+                // gate bit, so deferFlush (0x2DE40) runs on this draw.
+                *(int*)((char*)d + 0x47B0) = 1;
+                *(unsigned*)((char*)d + 0x18) = gate | 0x100000;
+            } __except (EXCEPTION_EXECUTE_HANDLER) { Log("       draw.pipe: (read fault)"); }
+        } else if (!strcmp(b.tag, "defer.run")) {
+            Log("       defer.run: 0x2DE9A reached (deferred flush running)");
+            s_phase = 0;  // new deferred flush: restart the BIND→UNBIND injection sequence
+            s_clearFired = false;
+        } else if (!strcmp(b.tag, "draw.rec")) {
+            Log("       draw.rec: recorder 0x2CCE0 reached");
+        } else if (!strcmp(b.tag, "st.flush")) {
+            // atiumd6a:0x2180 entry. r9 = new draw-params; *(r9+0x1B8) = new snapshot.
+            __try {
+                void* r9   = (void*)ep->ContextRecord->R9;
+                void* snap = r9 ? *(void**)((char*)r9 + 0x1B8) : nullptr;
+                void* h88  = snap ? *(void**)((char*)snap + 0x88) : nullptr;
+                unsigned s1a0 = snap ? *(unsigned*)((char*)snap + 0x1A0) : 0u;
+                Log("       st.flush: chan=%p r9=%p snap=%p [+0x88]=%p [+0x1A0]=%u",
+                    (void*)ep->ContextRecord->Rcx, r9, snap, h88, s1a0);
+            } __except (EXCEPTION_EXECUTE_HANDLER) { Log("       st.flush: (read fault)"); }
+        } else if (!strcmp(b.tag, "st.br241a")) {
+            // CMP [RSI+0x1A0], R15 at RVA 0x241A. RSI = viewport-state object = [rdx+0x18].
+            // The handler previously read RCX (which the BP log shows), but the CMP uses RSI.
+            // Log both and inject into [RSI+0x1A0] and [RSI+0x88] to pass the check.
+            void* rsi = (void*)ep->ContextRecord->Rsi;
+            void* rcx_snap = (void*)ep->ContextRecord->Rcx;
+            void* rdi_val = (void*)ep->ContextRecord->Rdi;
+            unsigned s1a0_rsi = 0, s1a0_rcx = 0;
+            void* h88_rsi = nullptr;
+            {
+                __try {
+                    h88_rsi  = rsi ? *(void**)((char*)rsi + 0x88) : nullptr;
+                    s1a0_rsi = rsi ? *(unsigned*)((char*)rsi + 0x1A0) : 0u;
+                    s1a0_rcx = rcx_snap ? *(unsigned*)((char*)rcx_snap + 0x1A0) : 0u;
+                    void* hres48 = h88_rsi ? *(void**)((char*)h88_rsi + 0x48) : nullptr;
+                    unsigned char rdiByte = 0;
+                    if (rdi_val) __try { rdiByte = *(unsigned char*)rdi_val; } __except(EXCEPTION_EXECUTE_HANDLER) { rdiByte = 0xEE; }
+                    Log("       st.br241a: RSI=%p [+0x88]=%p [+0x1A0]=%u hRes[+0x48]=%p RDI=%p [RDI]=%02x (%s)",
+                        rsi, h88_rsi, s1a0_rsi, hres48, rdi_val, rdiByte,
+                        s1a0_rsi ? "WILL FLUSH" : "WILL SKIP");
+                    Log("       st.br241a: RCX=%p [+0x1A0]=%u (inject source)", rcx_snap, s1a0_rcx);
+                    if (h88_rsi && !hres48) {
+                        for (int _off = 0x40; _off <= 0x100; _off += 8) {
+                            void* v = nullptr;
+                            __try { v = *(void**)((char*)h88_rsi + _off); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                            if (v && (uintptr_t)v > 0x10000)
+                                Log("       st.br241a: hRes[+0x%x]=%p (non-null)", _off, v);
+                        }
+                    }
+                } __except (EXCEPTION_EXECUTE_HANDLER) { Log("       st.br241a: (read fault)"); }
+            }
+            Log("       st.br241a: post-__try RSI=%p s1a0_rsi=%u RCX=%p s1a0_rcx=%u",
+                rsi, s1a0_rsi, rcx_snap, s1a0_rcx);
+#ifdef D3D9SHIM_DLL
+            // Inject the driver-side applied binding so the CMP passes; which half depends
+            // on the phase.  g_drvBoundHRes[0] is what the driver currently references --
+            // a released texture appears here only when it was destroyed without a prior
+            // unbind (the #4257 condition); the draw-committed snapshot must NOT be used
+            // here because it would re-present textures the driver already let go.
+            if (g_drawCommittedCount > 0 && rsi && !s_clearFired) {
+                HANDLE injectH0 = g_drvBoundHRes[0];
+                __try {
+                    // Populate the stage-entry record with the applied texture handle.
+                    // res0/res1 must be hRes only for BIND (s_phase==1); in UNBIND they are
+                    // s_nullRes so the driver takes the CLEAR path instead of re-BINDing.
+                    bool bindPhase = (s_phase == 1) && injectH0;
+                    g_stageRec.pad0 = nullptr;
+                    g_stageRec.res0 = bindPhase ? injectH0 : (HANDLE)s_nullRes;
+                    g_stageRec.res1 = bindPhase ? injectH0 : (HANDLE)s_nullRes;
+                    *(void**)((char*)rsi + 0x1A0) = (void*)&g_stageRec;
+                    if (s_phase == 1 && injectH0) {
+                        // Phase 1 BIND: set RSI[+0x88]=null so the driver sees no old binding.
+                        // Clear RDI so the dirty-flag check at 0x242C (CMP [RDI],R15B) passes;
+                        // RDI was loaded from [RSI+0x148] at 0x2260, and setting the register
+                        // directly avoids having to know whether [RSI+0x148] is safe to overwrite.
+                        *(void**)((char*)rsi + 0x88) = nullptr;
+                        ep->ContextRecord->Rdi = 0;
+                        Log("       st.br241a: BIND phase - RSI[+0x88]=null [+0x1A0]=&stageRec RDI->0");
+                    } else {
+                        // Initialize s_nullRes sentinel: [+8]=hRes (non-null), [+16]=1 so fn_1850 main path runs.
+                        // With no applied binding, self-reference s_nullRes: the sentinel is
+                        // static storage that is never released, so clr.inner reads stay mapped.
+                        *(ULONG_PTR*)(s_nullRes + 8)  = (ULONG_PTR)(injectH0 ? injectH0 : (HANDLE)s_nullRes);
+                        *(DWORD*)(s_nullRes + 16) = 1;
+                        Log("       st.br241a: UNBIND ph%d - s_nullRes[+8]=%p [+16]=1", s_phase,
+                            (void*)*(ULONG_PTR*)(s_nullRes + 8));
+                        // Phase 2+ UNBIND: inject RSI[+0x88]=hRes (the driver's BIND processing did NOT
+                        // update RSI[+0x88] in this emulated context, so we inject it manually).
+                        // Also zero RDI: the dirty-flag check at 0x242C (CMP [RDI],R15B) with [RDI]=1
+                        // causes st.skip; zeroing RDI matches the BIND path's pre-condition (RDI was
+                        // already 0 when BIND succeeded).
+                        *(void**)((char*)rsi + 0x88) = (void*)injectH0;
+                        ep->ContextRecord->Rdi = 0;
+                        Log("       st.br241a: UNBIND phase %d - RSI[+0x88]=hRes=%p [+0x1A0]=&stageRec RDI->0",
+                            s_phase, (void*)injectH0);
+                    }
+                } __except (EXCEPTION_EXECUTE_HANDLER) { Log("       st.br241a: inject fault"); }
+            } else if (s_clearFired) {
+                Log("       st.br241a: clear already fired - skipping re-injection (loop stop)");
+            }
+#endif
+        } else if (!strcmp(b.tag, "st.br22f8")) {
+            Log("       st.br22f8: STATES DIFFER branch reached (will continue to full flush)");
+        } else if (!strcmp(b.tag, "st.skip")) {
+            Log("       st.skip: flush SKIPPED (stage count was 0, no-op return)");
+        } else if (!strcmp(b.tag, "st.r14p90")) {
+            // 0x2435: MOV RAX, [R14+0x90]; if null, driver AVs into its own SEH → 0x24EF.
+            __try {
+                void* r14 = (void*)ep->ContextRecord->R14;
+                void* rbx = (void*)ep->ContextRecord->Rbx;
+                void* p90 = r14 ? *(void**)((char*)r14 + 0x90) : nullptr;
+                void* p90p20 = p90 ? *(void**)((char*)p90 + 0x20) : nullptr;
+                Log("       st.r14p90: R14=%p [+0x90]=%p [+0x90+0x20]=%p RBX=%p", r14, p90, p90p20, rbx);
+            } __except (EXCEPTION_EXECUTE_HANDLER) { Log("       st.r14p90: (read fault)"); }
+        } else if (!strcmp(b.tag, "st.baa5")) {
+            // 0xBAA5: TEST RBX,RBX before the crash-prone RBX!=0 path (faults at 0xBAB7
+            // on [RBX+8] when RBX is the sentinel 1).
+            __try {
+                void* rbx = (void*)ep->ContextRecord->Rbx;
+                void* rdx = (void*)ep->ContextRecord->Rdx;
+                void* rbxp8 = nullptr, *rbxp10 = nullptr;
+                __try {
+                    if (rbx) { rbxp8  = *(void**)((char*)rbx + 0x08); }
+                } __except(EXCEPTION_EXECUTE_HANDLER) { rbxp8 = (void*)0xDEAD0008; }
+                __try {
+                    if (rbx) { rbxp10 = *(void**)((char*)rbx + 0x10); }
+                } __except(EXCEPTION_EXECUTE_HANDLER) { rbxp10 = (void*)0xDEAD0010; }
+                Log("       st.baa5: RBX=%p [+0x08]=%p [+0x10]=%p  RDX(RSI)=%p",
+                    rbx, rbxp8, rbxp10, rdx);
+            } __except (EXCEPTION_EXECUTE_HANDLER) { Log("       st.baa5: (fault)"); }
+        } else if (!strcmp(b.tag, "st.b1850")) {
+            __try {
+                void* rcx = (void*)ep->ContextRecord->Rcx;
+                void* rdx = (void*)ep->ContextRecord->Rdx;
+                void* r8  = (void*)ep->ContextRecord->R8;
+                Log("       st.b1850: resource call: RCX=%p RDX=%p R8=%p", rcx, rdx, r8);
+                Log("       st.b1850: RDX(old)=%p vs committed hRes=%p  s_nullRes[+8]=%p",
+                    rdx, (void*)g_drawCommittedHRes[0], *(void**)(s_nullRes + 8));
+                // One-shot hex dump of the stage binding (RDX) -- the object the clear
+                // dispatch at atiumd64+0x53180 actually receives as RCX and reads [+0x10]
+                // from.  RCX here is hRes; the binding is what matters downstream.
+                static bool s_b1850_dumped = false;
+                if (!s_b1850_dumped && rdx && rcx == (void*)g_drawCommittedHRes[0]) {
+                    s_b1850_dumped = true;
+                    Log("       st.b1850: HEX DUMP stage_binding=%p (rcx=hRes):", rdx);
+                    __try {
+                        for (int o = 0; o < 0x70; o += 8) {
+                            Log("         [+0x%02x] = %p", o, *(void**)((char*)rdx + o));
+                        }
+                    } __except (EXCEPTION_EXECUTE_HANDLER) { Log("       st.b1850: (dump fault at some offset)"); }
+                }
+                // fn_1850(new=RCX, old=RDX, r8): when [new+8] and [new+0x10] pass it calls
+                // the old-resource clear through the indirect fn ptr at atiumd6a+0x82EA10
+                // (rcx=old, rdx=r8, r8d=1).  Resolve that slot so we can see which routine
+                // the clear dispatches to and why it never reaches st.uaf (0x12E90F).
+                static HMODULE s_a6a = nullptr;
+                if (!s_a6a) s_a6a = GetModuleHandleA("atiumd6a.dll");
+                if (s_a6a) {
+                    void* tgt = *(void**)((char*)s_a6a + 0x82EA10);
+                    char w[300];
+                    Log("       st.b1850: clear dispatch [a6a+0x82EA10]=%s",
+                        tgt ? Where(tgt, w, sizeof w) : "(null)");
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) { Log("       st.b1850: (fault)"); }
+        } else if (!strcmp(b.tag, "st.ret244a")) {
+            Log("       st.ret244a: vtable CALL at 0x244A returned OK");
+            // With the deep-flush recursion broken, the flush epilogue past 0x2499 now
+            // runs: at 0x24CF it calls 0x3E240 -> 0xB020, which feeds [p58+0x188] to the
+            // handle mapper at [atiumd6a+0x82EA38].  Injecting our hRes there made the
+            // mapper return garbage (AV at 0xB051 reading 0x100000011).  Leave the
+            // driver's own value in place and just observe, so the epilogue can run.
+            if (s_phase == 1 && s_vtblObj && !s_clearFired) {
+                __try {
+                    void* p58 = *(void**)((char*)s_vtblObj + 0x58);
+                    if (p58) {
+                        void* old188 = *(void**)((char*)p58 + 0x188);
+                        static HMODULE s_a6a3 = nullptr;
+                        if (!s_a6a3) s_a6a3 = GetModuleHandleA("atiumd6a.dll");
+                        void* mapper = s_a6a3 ? *(void**)((char*)s_a6a3 + 0x82EA38) : nullptr;
+                        char w[300];
+                        Log("       st.ret244a: BIND observe [vtblObj+0x58+0x188]=%p (NOT injecting hRes=%p); mapper=%s",
+                            old188, (void*)g_drawCommittedHRes[0],
+                            mapper ? Where(mapper, w, sizeof w) : "(null)");
+                    }
+                } __except(EXCEPTION_EXECUTE_HANDLER) { Log("       st.ret244a: inject fault"); }
+            }
+        } else if (!strcmp(b.tag, "clr.dispatch")) {
+            Log("       clr.dispatch: RCX=%p RDX=%p R8=%p R9=%p",
+                (void*)ep->ContextRecord->Rcx, (void*)ep->ContextRecord->Rdx,
+                (void*)ep->ContextRecord->R8, (void*)ep->ContextRecord->R9);
+        } else if (!strcmp(b.tag, "clr.inner")) {
+            void* r9 = (void*)ep->ContextRecord->R9;
+            unsigned r9p10 = 0;
+            bool r9IsBait = false;
+            // Never touch a fenced bait page from our own instrumentation: the driver's
+            // next instruction (cmp dword [r9+0x10],0 at 0x596E7) must be the one that
+            // faults, so the FENCE UAF is attributed to the driver, not to this read.
+            // Compare page-aligned: R9 is typically the hRes itself (self-patched
+            // [hRes+8]), which sits at page_base+8 on its fenced VA page.
+            uintptr_t r9page = (uintptr_t)r9 & ~(uintptr_t)0xFFF;
+            PoolLock();
+            for (int _i = 0; _i < g_fencedCount; _i++)
+                if ((uintptr_t)g_fenced[_i].page_base == r9page && !g_fenced[_i].triggered) { r9IsBait = true; break; }
+            PoolUnlock();
+            if (r9IsBait) {
+                Log("       clr.inner: R9=%p IS BAIT (fenced) -- leaving the [R9+0x10] read to the driver", r9);
+            } else {
+                __try { if (r9) r9p10 = *(unsigned*)((char*)r9 + 0x10); } __except(EXCEPTION_EXECUTE_HANDLER) {}
+                Log("       clr.inner: RCX=%p RDX=%p R8=%p R9=%p [R9+0x10]=%u",
+                    (void*)ep->ContextRecord->Rcx, (void*)ep->ContextRecord->Rdx,
+                    (void*)ep->ContextRecord->R8, r9, r9p10);
+            }
+        } else if (!strcmp(b.tag, "clr.path2")) {
+            Log("       clr.path2: about to call [device_inner+0xD8]: R8=%p",
+                (void*)ep->ContextRecord->R8);
+        } else if (!strcmp(b.tag, "st.callc0")) {
+            __try {
+                void* obj = (void*)ep->ContextRecord->Rcx;
+                void* vtbl = obj ? *(void**)obj : nullptr;
+                void* fn = vtbl ? *(void**)((char*)vtbl + 0xc0) : nullptr;
+                char w[300];
+                Log("       st.callc0: obj=%p vtbl=%p fn[+0xc0]=%s",
+                    obj, vtbl, fn ? Where(fn, w, sizeof w) : "(null)");
+                if (s_phase == 1 && !s_clearFired) {
+                    s_vtblObj = obj;
+                    Log("       st.callc0: BIND - saved s_vtblObj=%p", obj);
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        } else if (!strcmp(b.tag, "st.baef")) {
+            Log("       st.baef: RBX=0 path at 0xBAEF taken");
+        } else if (!strcmp(b.tag, "st.call38")) {
+            __try {
+                void* obj = (void*)ep->ContextRecord->Rcx;
+                Log("       st.call38: obj=%p vtbl=%p", obj, obj ? *(void**)obj : nullptr);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        } else if (!strcmp(b.tag, "st.call20")) {
+            __try {
+                void* obj = (void*)ep->ContextRecord->Rcx;
+                void* vtbl = obj ? *(void**)obj : nullptr;
+                void* fn = vtbl ? *(void**)((char*)vtbl + 0x20) : nullptr;
+                char w[300];
+                Log("       st.call20: obj=%p vtbl=%p fn[+0x20]=%s (entering deep flush path)",
+                    obj, vtbl, fn ? Where(fn, w, sizeof w) : "(null)");
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+#ifdef D3D9SHIM_DLL
+            // The deep flush (atiumd6a:0x1D30, rbp=rdx=channel) calls atiumd64:0x51D80 with
+            // rcx=[channel+0x188]; that function dereferences [rcx+0x10] as the resource's
+            // backing object and writes [backing+0x1A4]/[+0x1A8].  When the ret244a BIND
+            // injection put hRes into the slot, [hRes+0x10] is null (or the sentinel 1 the
+            // SNAP INJECT planted) because the driver never allocated backing for the
+            // emulated resource, so the write AVs at address 0x1A4.  Install a zeroed,
+            // committed stand-in so the driver's own flag-clearing completes.
+            __try {
+                void* chan2 = (void*)ep->ContextRecord->Rdx;
+                void* slot = chan2 ? *(void**)((char*)chan2 + 0x188) : nullptr;
+                if (slot && (uintptr_t)slot > 0x10000) {
+                    void* backing = *(void**)((char*)slot + 0x10);
+                    Log("       st.call20: [chan+0x188]=%p [slot+0x10](backing)=%p", slot, backing);
+                    // Only patch slots that hold one of the shim's committed resource
+                    // handles -- never a driver-owned object that happens to be there.
+                    bool ours = false;
+                    for (int _i = 0; _i < 16; _i++)
+                        if (slot == (void*)g_drawCommittedHRes[_i] && g_drawCommittedHRes[_i]) { ours = true; break; }
+                    if (ours && (uintptr_t)backing < 0x10000) {
+                        // Prefer the real device_inner: atiumd64:0x51D80 then clears
+                        // [device_inner+0x1A4]/[+0x1A8] exactly as in the unmodified flow
+                        // (slot=holder, [holder+0x10]=device_inner) and the stateApply gate
+                        // finds its [+0x600] -> [+0x20] chain already live.  Fall back to
+                        // the zeroed stand-in (its +0x600 wired to the real holder).
+                        void* install = s_realDevInner ? s_realDevInner : (void*)s_resBacking;
+                        *(void**)((char*)slot + 0x10) = install;
+                        Log("       st.call20: installed backing %p (%s) at [slot %p+0x10]",
+                            install, s_realDevInner ? "real device_inner" : "zeroed stand-in", slot);
+                    }
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) { Log("       st.call20: backing install fault"); }
+            // The deep flush at atiumd6a:0x1D30 (called here) never returns to 0x2499
+            // (st.ret2496 armed, 0 hits in 931 calls).  It reads [r8+0x1B8]/[r8+0x1C0]
+            // and [r9+0x1B8]/[r9+0x1C0] -- the two snapshots' chain links -- before the
+            // indirect submit call; a null link AVs at 0x1EC4/0x1EDA into driver SEH.
+            // Log the links once per unique pair so the next run can see the culprit.
+            static int s_dfDumped = 0;
+            if (s_dfDumped < 3) {
+                s_dfDumped++;
+                __try {
+                    void* s1 = (void*)ep->ContextRecord->R8;
+                    void* s2 = (void*)ep->ContextRecord->R9;
+                    void* l1 = s1 ? *(void**)((char*)s1 + 0x1B8) : nullptr;
+                    void* l2 = s2 ? *(void**)((char*)s2 + 0x1B8) : nullptr;
+                    Log("       st.call20: deepflush args snap1=%p [+0x1B8]=%p  snap2=%p [+0x1B8]=%p",
+                        s1, l1, s2, l2);
+                } __except (EXCEPTION_EXECUTE_HANDLER) { Log("       st.call20: (link dump fault)"); }
+            }
+#endif
+        } else if (!strcmp(b.tag, "st.uaf")) {
+            __try {
+                void* rcx = (void*)ep->ContextRecord->Rcx;
+                Log("       st.uaf: ENTERED! RCX=%p (texture-clear fn begins)", rcx);
+                Log("ST.UAF FIRED = CLEAR PATH REACHED (old=hRes, new=null transition)");
+            } __except(EXCEPTION_EXECUTE_HANDLER) {}
+        } else if (!strcmp(b.tag, "st.sub24e0")) {
+            Log("       st.sub24e0: command-submit vtable call at 0x24E0");
+        } else if (!strcmp(b.tag, "st.ret2496")) {
+            Log("       st.ret2496: call at 0x2496 RETURNED eax=%08x", (unsigned)ep->ContextRecord->Rax);
+        } else if (!strcmp(b.tag, "st.dfcall")) {
+            // atiumd6a:0x1D30+0x1B7: the deep flush's last act is an indirect call
+            // through the global fn ptr at atiumd6a+0x82EA28, with rcx=[channel+0x188]
+            // and rdx=&record on the stack.  0x2499 never sees a return, so the truth
+            // about whether 0x1D30 completes lives here and at st.dfret.
+            __try {
+                static HMODULE s_a6a2 = nullptr;
+                if (!s_a6a2) s_a6a2 = GetModuleHandleA("atiumd6a.dll");
+                void* tgt = s_a6a2 ? *(void**)((char*)s_a6a2 + 0x82EA28) : nullptr;
+                char w[300];
+                Log("       st.dfcall: rcx=%p rdx=%p rsp=%p target=%s",
+                    (void*)ep->ContextRecord->Rcx, (void*)ep->ContextRecord->Rdx,
+                    (void*)ep->ContextRecord->Rsp,
+                    tgt ? Where(tgt, w, sizeof w) : "(null)");
+            } __except (EXCEPTION_EXECUTE_HANDLER) { Log("       st.dfcall: (fault)"); }
+            // Chain walk (first few calls only): 0x51D80 resolves record+0x48/+0x58 into
+            // two objects and re-enters stateApply with them; stateApply's gate reads
+            // [obj+0x1B8] again.  If the chain is stale/cyclic the flush recurses
+            // forever, which is exactly what "0x2499 never fires" looks like.
+            static int s_dfWalk = 0;
+            if (s_dfWalk < 3) {
+                s_dfWalk++;
+                __try {
+                    char* rec = (char*)ep->ContextRecord->Rdx;
+                    for (int k = 0; k < 2; k++) {
+                        char* o = *(char**)(rec + 0x48 + k * 0x10);
+                        if (!o) { Log("       st.dfcall: rec[+0x%02x]=null", 0x48 + k * 0x10); continue; }
+                        unsigned type = *(unsigned*)(o + 4);
+                        void* link = *(void**)(o + 0x1B8);
+                        unsigned f1c0 = *(unsigned*)(o + 0x1C0);
+                        void* link2 = nullptr;
+                        if (link && (uintptr_t)link > 0x10000)
+                            __try { link2 = *(void**)((char*)link + 0x1B8); } __except (EXCEPTION_EXECUTE_HANDLER) { link2 = (void*)-1; }
+                        Log("       st.dfcall: rec[+0x%02x]=%p type=%u [+0x1B8]=%p [+0x1C0]=%x link[+0x1B8]=%p",
+                            0x48 + k * 0x10, o, type, link, f1c0, link2);
+                    }
+                    static HMODULE s_a64 = nullptr;
+                    if (!s_a64) s_a64 = GetModuleHandleA("atiumd64.dll");
+                    void* gate = s_a64 ? *(void**)((char*)s_a64 + 0x7F45C0) : nullptr;
+                    char w2[300];
+                    Log("       st.dfcall: gate target [a64+0x7F45C0]=%s",
+                        gate ? Where(gate, w2, sizeof w2) : "(null)");
+                } __except (EXCEPTION_EXECUTE_HANDLER) { Log("       st.dfcall: (walk fault)"); }
+            }
+        } else if (!strcmp(b.tag, "st.dfret")) {
+            Log("       st.dfret: deep-flush inner call RETURNED eax=%08x", (unsigned)ep->ContextRecord->Rax);
+        } else if (!strcmp(b.tag, "sa.gatechk")) {
+            // stateApply+0x24: rbp = [params+0x58] (resolved object A).  The gate call
+            // at 0x3034D is skipped when [rbp+0x1B8]==0 -- the recursion base case.
+            static int s_gc = 0;
+            if (s_gc < 6) {
+                s_gc++;
+                __try {
+                    void* rbp = (void*)ep->ContextRecord->Rbp;
+                    void* link = rbp ? *(void**)((char*)rbp + 0x1B8) : nullptr;
+                    Log("       sa.gatechk: rbp=%p [rbp+0x1B8]=%p (%s)", rbp, link,
+                        link ? "GATE TAKEN -> recursion" : "gate skipped");
+                } __except (EXCEPTION_EXECUTE_HANDLER) { Log("       sa.gatechk: (fault)"); }
+            }
+#ifdef D3D9SHIM_DLL
+            // Break the flush recursion.  stateApply is entered two ways: from the
+            // recorder's deferred-flush path (legitimate: the gate must fire so the
+            // flush runs) and from 0x51D80+0x3AD (atiumd64+0x520E2 return address), the
+            // deep flush re-entering stateApply with stale resolved objects whose
+            // [+0x1B8] links are only ever cleared by the flush epilogue past
+            // atiumd6a:0x2499 -- which never runs because the gate recurses first.
+            // Chicken-and-egg.  On the nested entry, hide the stale link so the gate
+            // is skipped and the whole chain unwinds for the first time.
+            __try {
+                static HMODULE s_a64b = nullptr;
+                if (!s_a64b) s_a64b = GetModuleHandleA("atiumd64.dll");
+                // 5 pushes + sub rsp,0x40 in stateApply's prologue: caller's return
+                // address lives at [rsp+0x68] here.
+                void* retaddr = *(void**)((char*)ep->ContextRecord->Rsp + 0x68);
+                if (s_a64b && retaddr == (void*)((char*)s_a64b + 0x520E2)) {
+                    void* rbp = (void*)ep->ContextRecord->Rbp;
+                    void* old = rbp ? *(void**)((char*)rbp + 0x1B8) : nullptr;
+                    if (rbp && old) {
+                        *(void**)((char*)rbp + 0x1B8) = nullptr;
+                        static int s_unlink = 0;
+                        if (s_unlink < 8) {
+                            s_unlink++;
+                            Log("       sa.gatechk: NESTED stateApply -- unlinked [rbp %p+0x1B8] (was %p) to stop recursion",
+                                rbp, old);
+                        }
+                    }
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) { Log("       sa.gatechk: (unlink fault)"); }
+#endif
+        } else if (!strcmp(b.tag, "gate.call")) {
+            __try {
+                char w[300];
+                void* rax = (void*)ep->ContextRecord->Rax;
+                Log("       gate.call: rcx=%p rax=%s rsp=%p", (void*)ep->ContextRecord->Rcx,
+                    rax ? Where(rax, w, sizeof w) : "(null)", (void*)ep->ContextRecord->Rsp);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        } else if (!strcmp(b.tag, "gate.ret")) {
+            Log("       gate.ret: flush returned eax=%08x", (unsigned)ep->ContextRecord->Rax);
+        } else if (!strcmp(b.tag, "sub.resolved")) {
+            // 0x51D80+0x7D: rsi/rdi = the two objects resolved from record+0x48/+0x58.
+            // stateApply is about to be re-entered with these; their +0x1B8 links decide
+            // whether the gate recurses.
+            static int s_sr = 0;
+            if (s_sr < 6) {
+                s_sr++;
+                __try {
+                    void* rsi = (void*)ep->ContextRecord->Rsi;
+                    void* rdi = (void*)ep->ContextRecord->Rdi;
+                    void* ls = rsi ? *(void**)((char*)rsi + 0x1B8) : nullptr;
+                    void* ld = rdi ? *(void**)((char*)rdi + 0x1B8) : nullptr;
+                    Log("       sub.resolved: rsi=%p [+0x1B8]=%p  rdi=%p [+0x1B8]=%p", rsi, ls, rdi, ld);
+                } __except (EXCEPTION_EXECUTE_HANDLER) { Log("       sub.resolved: (fault)"); }
+            }
+        } else if (!strcmp(b.tag, "sub.callSA")) {
+            Log("       sub.callSA: 0x51D80 re-enters stateApply (rcx=%p rdx=%p)",
+                (void*)ep->ContextRecord->Rcx, (void*)ep->ContextRecord->Rdx);
+        } else if (!strcmp(b.tag, "sub.retSA")) {
+            Log("       sub.retSA: stateApply returned eax=%08x", (unsigned)ep->ContextRecord->Rax);
+        } else if (!strcmp(b.tag, "st.crash64")) {
+            Log("       st.crash64: at atiumd64+0x59827 before crash");
+        } else if (!strcmp(b.tag, "clear.call")) {
+            // atiumd64:0x596D0+0x88: about to call r8=[device_inner+0xD8] with
+            // rcx=[device_inner+8], rdx=&record ([rsp+0x20]).  This is the inner
+            // clear the fn_1850 dispatch reaches when [hRes+0x10] is non-null.
+            __try {
+                void* r8fn = (void*)ep->ContextRecord->R8;
+                char w[300];
+                Log("       clear.call: rcx=%p rdx=%p r8=%s",
+                    (void*)ep->ContextRecord->Rcx, (void*)ep->ContextRecord->Rdx,
+                    r8fn ? Where(r8fn, w, sizeof w) : "(null)");
+            } __except (EXCEPTION_EXECUTE_HANDLER) { Log("       clear.call: (fault)"); }
         } else if (!strcmp(b.tag, "newbuf.chk")) {
             void* rdi = (void*)ep->ContextRecord->Rdi;
             __try { Log("       newbuf: [chunk+0x4E60]=%p [0]=%p", rdi, *(void**)rdi); }
@@ -333,8 +1087,19 @@ static void OnBp(EXCEPTION_POINTERS* ep)
                 if (tgt >= (uintptr_t)d.block && tgt < (uintptr_t)d.block + 152)
                     { hit = true; break; }
             if (!strcmp(b.tag, "clear.A")) g_clearAHits++;
-            Log("       clear write: target=%p [target+0x64]=%p %s",
-                (void*)tgt, (void*)(tgt + 0x64), hit ? "*** DECOY HIT ***" : "not a decoy");
+            // Also read the current value at the write target (the UAF write overwrites it).
+            void* curVal = nullptr;
+            __try { curVal = *(void**)(tgt + 0x64); } __except(EXCEPTION_EXECUTE_HANDLER) { curVal = (void*)0xDEAD0064; }
+            Log("       clear write: target=%p [+0x64]@%p=%p r15=%p %s",
+                (void*)tgt, (void*)(tgt + 0x64), curVal, (void*)ep->ContextRecord->R15,
+                hit ? "*** DECOY HIT ***" : "not a decoy");
+            if (!strcmp(b.tag, "clear.A")) {
+                s_clearFired = true;  // stop the UNBIND re-injection loop after the first CLEAR
+                Log("       clear.A: MOV [RBX+0x64], R15 about to execute: RBX=%p R15=%p TARGET=%p",
+                    (void*)ep->ContextRecord->Rbx, (void*)ep->ContextRecord->R15,
+                    (void*)(ep->ContextRecord->Rbx + 0x64));
+                Log("CLEAR.A WRITE SITE REACHED - UAF WRITE IMMINENT");
+            }
         } else if (!strcmp(b.tag, "relobj")) {
             // 0x13E260: virtual call target that crashes at +0x31 because [rcx+8] = FFFFFFFFFFFFFFFF.
             // rcx = the object (rdi in the function body); dump vtable and key fields to identify it.
@@ -366,36 +1131,168 @@ static void OnBp(EXCEPTION_POINTERS* ep)
     }
 }
 
+#ifdef D3D9SHIM_DLL
+static bool HandleHwWpException(EXCEPTION_POINTERS* ep);
+static void ArmWriteWatchpoint(uintptr_t addr, void* freed_obj);
+#endif
+
 static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep)
 {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
+#ifdef D3D9SHIM_DLL
+    if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2) {
+        uintptr_t faultAddr = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
+        PoolLock();
+        FencedBlock* fb = nullptr;
+        bool fenceNoise = false;
+        void* noisePage = nullptr;
+        for (int i = 0; i < g_fencedCount; i++) {
+            if (g_fenced[i].triggered) continue;
+            if (faultAddr >= (uintptr_t)g_fenced[i].page_base &&
+                faultAddr <  (uintptr_t)g_fenced[i].page_base + 4096) {
+                // Heap pages are shared: a fault OUTSIDE the freed block's extent is
+                // another (still-live) allocation on the same page -- heap noise, not a
+                // UAF.  Only a fault inside [obj_ptr, obj_ptr+obj_size) counts.
+                uintptr_t o = (uintptr_t)g_fenced[i].obj_ptr;
+                if (faultAddr >= o && faultAddr < o + g_fenced[i].obj_size) {
+                    fb = &g_fenced[i];
+                    fb->triggered = true;
+                    break;
+                }
+                fenceNoise = true;
+                noisePage = g_fenced[i].page_base;
+            }
+        }
+        PoolUnlock();
+        if (fenceNoise && !fb) {
+            // Restore access so the process can continue, but do not report this as a
+            // FENCE UAF: it is not the freed object being touched.
+            Log("fence-noise: fault_addr=%p on fenced page %p (outside freed extent; access restored)",
+                (void*)faultAddr, noisePage);
+            DWORD old;
+            VirtualProtect(noisePage, 4096, PAGE_READWRITE, &old);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if (fb) {
+            uintptr_t rip = ep->ContextRecord->Rip;
+            HMODULE hmod = nullptr;
+            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCSTR)rip, &hmod);
+            char modName[MAX_PATH] = "?";
+            if (hmod) GetModuleFileNameA(hmod, modName, sizeof(modName));
+            uintptr_t rva = rip - (uintptr_t)hmod;
+            // Heap recycling: a fenced block went back to the heap at DestroyResource, and
+            // the heap hands its memory out again.  ntdll heap code (carving the new
+            // block) or our own shim (heap hooks / BP handlers) touching the page means
+            // the block has been REUSED -- the new owner's accesses are legitimate, so
+            // disarm the entry rather than reporting a UAF.  Only a fault from another
+            // module (the driver) inside the freed extent is a stale-reference candidate.
+            if (strstr(modName, "ntdll.dll")) {
+                Log("fence-recycle: fault_addr=%p freed_obj=%p from %s+0x%llx -- block reused, disarmed",
+                    (void*)faultAddr, fb->obj_ptr, modName, (unsigned long long)rva);
+                DWORD old;
+                VirtualProtect(fb->page_base, 4096, PAGE_READWRITE, &old);
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            if (strstr(modName, "d3d9.dll")) {
+                // Our own instrumentation touched the fenced block (a diagnostic read
+                // or the stateApply self-ref patch).  Disarming here would un-fence the
+                // page BEFORE the driver's stale access, and the real UAF would never
+                // be seen -- exactly what happened to the STILL BOUND pump runs.  All
+                // shim touches of resource memory are __try-protected, so pass the
+                // fault to the shim's own SEH and keep the page fenced.
+                Log("fence-shim: fault_addr=%p freed_obj=%p from %s+0x%llx -- page KEPT fenced",
+                    (void*)faultAddr, fb->obj_ptr, modName, (unsigned long long)rva);
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            Log("*** FENCE UAF: fault_addr=%p freed_obj=%p from %s+0x%llx (rip=%p)",
+                (void*)faultAddr, fb->obj_ptr,
+                modName, (unsigned long long)rva, (void*)rip);
+            DWORD old;
+            VirtualProtect(fb->page_base, 4096, PAGE_READWRITE, &old);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        // The fakeInner VirtualAlloc page (fenced to PAGE_NOACCESS on Release) is not in
+        // g_fenced; catch its UAF fault the same way so it logs instead of crashing.
+        if (!fb && g_wpInnerPtr) {
+            uintptr_t page = (uintptr_t)g_wpInnerPtr & ~(uintptr_t)0xFFF;
+            if (faultAddr >= page && faultAddr < page + 4096) {
+                uintptr_t rip = ep->ContextRecord->Rip;
+                HMODULE hmod = nullptr;
+                GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCSTR)rip, &hmod);
+                char modName[MAX_PATH] = "?";
+                if (hmod) GetModuleFileNameA(hmod, modName, sizeof(modName));
+                uintptr_t rva = rip - (uintptr_t)hmod;
+                Log("*** FENCE UAF: fault_addr=%p freed_obj=%p from %s+0x%llx (rip=%p)",
+                    (void*)faultAddr, g_wpInnerPtr,
+                    modName, (unsigned long long)rva, (void*)rip);
+                DWORD old;
+                VirtualProtect((void*)page, 4096, PAGE_READWRITE, &old);
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
+    }
+#endif
     if (code == STATUS_BREAKPOINT) {
         uintptr_t at = (uintptr_t)ep->ExceptionRecord->ExceptionAddress;
-        for (auto& b : g_bps)
-            if (b.addr == at) { OnBp(ep); return EXCEPTION_CONTINUE_EXECUTION; }
+        BpsLock();
+        for (size_t i = 0; i < g_bpsCount; i++)
+            if (g_bps[i].addr == at) { OnBp(ep); BpsUnlock(); return EXCEPTION_CONTINUE_EXECUTION; }
+        // An int3 at an armed address that matches no entry means the table was corrupted
+        // (previously: the heap vector's buffer sat in the 152-byte class and the driver's
+        // stray write zeroed it) — say so rather than passing silently.
+        char wb[300];
+        Log("!! unmatched int3 at %s (g_bps entries: %zu)", Where((void*)at, wb, sizeof wb),
+            g_bpsCount);
+        for (size_t i = 0; i < g_bpsCount; i++)
+            Log("!!   g_bps: %s at %p (orig %02x)", g_bps[i].tag, (void*)g_bps[i].addr,
+                g_bps[i].orig);
+        BpsUnlock();
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    if (code == EXCEPTION_SINGLE_STEP && g_rearm) {
-        uintptr_t at = g_rearm;
-        g_rearm = 0;
-        for (auto& b : g_bps)
-            if (b.addr == at) {
-                DWORD old;
-                VirtualProtect((void*)at, 1, PAGE_EXECUTE_READWRITE, &old);
-                *(unsigned char*)at = 0xCC;
-                VirtualProtect((void*)at, 1, old, &old);
-            }
-        ep->ContextRecord->EFlags &= ~0x100u;
+    if (code == EXCEPTION_SINGLE_STEP) {
+#ifdef D3D9SHIM_DLL
+        // A hardware watchpoint from the pool hook (legacy9_pool.cpp) also arrives as a
+        // single-step; let it claim the exception first when no bp re-arm is pending.
+        if (HandleHwWpException(ep) && !g_rearm)
+            return EXCEPTION_CONTINUE_EXECUTION;
+#endif
+        if (g_rearm) {
+            uintptr_t at = g_rearm;
+            g_rearm = 0;
+            BpsLock();
+            for (size_t i = 0; i < g_bpsCount; i++)
+                if (g_bps[i].addr == at) {
+                    DWORD old;
+                    VirtualProtect((void*)at, 1, PAGE_EXECUTE_READWRITE, &old);
+                    *(unsigned char*)at = 0xCC;
+                    VirtualProtect((void*)at, 1, old, &old);
+                }
+            BpsUnlock();
+            ep->ContextRecord->EFlags &= ~0x100u;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    char w[300];
+    if ((code >> 16) == 0x4001 &&
+        !(ep->ExceptionRecord->ExceptionFlags & EXCEPTION_NONCONTINUABLE)) {
+        // D3D/debugger notification: swallow silently so the process doesn't terminate.
         return EXCEPTION_CONTINUE_EXECUTION;
     }
-    if (code < 0xC0000000 || code == 0xE06D7363) return EXCEPTION_CONTINUE_SEARCH;
-    char w[300];
+    if (code < 0xC0000000 || code == 0xE06D7363) {
+        Log("!! non-error exception %08lx at %s", code, Where(ep->ExceptionRecord->ExceptionAddress, w, sizeof w));
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     Log("!! exception %08lx at %s", code, Where(ep->ExceptionRecord->ExceptionAddress, w, sizeof w));
     if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2)
         Log("!!   %s address %p", ep->ExceptionRecord->ExceptionInformation[0] ? "writing" : "reading",
             (void*)ep->ExceptionRecord->ExceptionInformation[1]);
-    void* st[12];
-    USHORT n = RtlCaptureStackBackTrace(0, 12, st, nullptr);
+    void* st[12] = {};
+    USHORT n = 0;
+    __try { n = RtlCaptureStackBackTrace(0, 12, st, nullptr); } __except(EXCEPTION_EXECUTE_HANDLER) {}
     for (USHORT i = 0; i < n; i++) Log("!!   frame %s", Where(st[i], w, sizeof w));
 
     // At the reserve fault (emit helper, atiumd64+0x5447bf) rcx still holds the command-buffer manager (the
@@ -446,121 +1343,9 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep)
                     Where((void*)ctx2.Rip, fw2, sizeof fw2), (void*)ctx2.R14, (void*)ctx2.Rcx, (void*)ctx2.Rdx);
             }
         }
-        if (rva == 0x118753 && ep->ContextRecord) {
-            // Inside atiumd6a:0x128680+0xD3: "mov rax,[r14]" where r14=[channel+0x80]=null.
-            // The flush passes rdx (real channel) to this helper; the real channel has [+0x80]=0
-            // in this stale-draw context.  Rather than cascade through real driver code, we
-            // simulate a successful return (rax=1) by unwinding the function's stack frame.
-            //
-            // Prologue of 0x128680: 6 × push + sub rsp,0xA8 → frame = 0xD8 from retaddr.
-            // Stack at crash point (cx.Rsp = RSP0 - 0xD8):
-            //   [+0xA8]=saved rbp, [+0xB0]=saved rbx, [+0xB8]=saved rsi
-            //   [+0xC0]=saved r12, [+0xC8]=saved r14, [+0xD0]=saved r15
-            //   [+0xD8]=return address (flush:0x13CB64)
-            CONTEXT& cx = *ep->ContextRecord;
-            Log("!! 0x128680+0xD3: forced-return; r14=%p rsp=%p retaddr=%p",
-                (void*)cx.R14, (void*)cx.Rsp, (void*)*(ULONG_PTR*)(cx.Rsp + 0xD8));
-            __try {
-                // Push order: rbp, rbx, rsi, r12, r14, r15 → last pushed (r15) is at lowest addr.
-                // RSP at crash = RSP0_fn - 0xD8.  Saved registers (ascending from RSP):
-                //   [+0xA8]=r15  [+0xB0]=r14  [+0xB8]=r12  [+0xC0]=rsi  [+0xC8]=rbx  [+0xD0]=rbp
-                cx.R15 = *(ULONG_PTR*)(cx.Rsp + 0xA8);
-                cx.R14 = *(ULONG_PTR*)(cx.Rsp + 0xB0);  // flush's r14 = s_fakeSb
-                cx.R12 = *(ULONG_PTR*)(cx.Rsp + 0xB8);
-                cx.Rsi = *(ULONG_PTR*)(cx.Rsp + 0xC0);
-                cx.Rbx = *(ULONG_PTR*)(cx.Rsp + 0xC8);
-                cx.Rbp = *(ULONG_PTR*)(cx.Rsp + 0xD0);
-                ULONG_PTR retAddr = *(ULONG_PTR*)(cx.Rsp + 0xD8);
-                cx.Rsp += 0xE0;
-                cx.Rip = retAddr;
-                cx.Rax = 1;
-                return EXCEPTION_CONTINUE_EXECUTION;
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                Log("!!   forced-return read fault — unwind skipped");
-            }
-        }
-        // All these sites share the pattern:
-        //   mov rcx,[r13/rdi+0x10]; (non-null) mov rcx,[rcx+0x38]=null; then mov rax,[rcx] crash.
-        // Set rcx=s_fakeChan10 (vtable=s_stubVtbl, [+0x38]=self-ref) so the subsequent virtual
-        // call returns 0 (StubRet0) without crashing.
-        // Flush main body: 0x12CE63 (flush+0x1D13), 0x12D1EA (flush+0x89A).
-        // sub_13E8D0:       0x12E978 (+0xA8), 0x12E9AF (+0xDF), 0x12E9E6 (+0x116), 0x12EA1D (+0x14D).
-        // Cleanup crash: cmp [rdi],0 where rdi=-1 (not found sentinel).
-        // Jump to the jz target (0x2A3379 = +0xC9) which is the "empty/skip" path.
-        if (rva == 0x2932b0 && ep->ContextRecord) {
-            ep->ContextRecord->Rip += 0xC9;
-            Log("!! cleanup 0x2A32B0: rdi=-1, skipped to jz target");
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
-        // Cleanup crash: mov rax,[rsi+0xD0] where rsi is a sentinel so rsi+0xD0=-1.
-        // Also simulate the two callee-restore moves that follow before the test+jz.
-        // Jump to the jz target (0x2A33AD = +0x25) which is the "null/skip" path.
-        if (rva == 0x293388 && ep->ContextRecord) {
-            CONTEXT& cx = *ep->ContextRecord;
-            __try {
-                cx.Rdi = *(ULONG_PTR*)(cx.Rsp + 0xF8); // mov rdi,[rsp+0xF8]
-                cx.Rbx = *(ULONG_PTR*)(cx.Rsp + 0xE8); // mov rbx,[rsp+0xE8]
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                Log("!!   0x2A3388 epilog restore fault — registers not restored");
-            }
-            cx.Rax = 0;
-            cx.Rip += 0x25; // 0x2A3388 -> 0x2A33AD (jz target)
-            Log("!! cleanup 0x2A3388: rsi sentinel, skipped to jz target");
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
-        if ((rva == 0x12ce63 || rva == 0x12d1ea ||
-             rva == 0x12e978 || rva == 0x12e9af ||
-             rva == 0x12e9e6 || rva == 0x12ea1d) && ep->ContextRecord) {
-            ep->ContextRecord->Rcx = (ULONG_PTR)s_fakeChan10;
-            Log("!! [ch+0x10] crash @+0x%x: rcx→fakeChan10", rva - 0x12C950);
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
-        if (rva == 0x11cb9f && ep->ContextRecord) {
-            // atiumd6a:0x12CAD0+0xCF: "mov rax,[r15]" where r15=[channel+0x80]=null.
-            // Different prologue: push rbp,rbx,r12,r13,r14,r15 + mov rbp,rsp + sub rsp,0x58.
-            // Frame = 0x30 + 0x58 = 0x88.  r14 (flush's s_fakeSb) is at [rsp+0x60].
-            CONTEXT& cx = *ep->ContextRecord;
-            Log("!! 0x12CAD0+0xCF: forced-return; rsp=%p retaddr=%p",
-                (void*)cx.Rsp, (void*)*(ULONG_PTR*)(cx.Rsp + 0x88));
-            __try {
-                cx.R15 = *(ULONG_PTR*)(cx.Rsp + 0x58);
-                cx.R14 = *(ULONG_PTR*)(cx.Rsp + 0x60);
-                cx.R13 = *(ULONG_PTR*)(cx.Rsp + 0x68);
-                cx.R12 = *(ULONG_PTR*)(cx.Rsp + 0x70);
-                cx.Rbx = *(ULONG_PTR*)(cx.Rsp + 0x78);
-                cx.Rbp = *(ULONG_PTR*)(cx.Rsp + 0x80);
-                ULONG_PTR retAddr = *(ULONG_PTR*)(cx.Rsp + 0x88);
-                cx.Rsp += 0x90;
-                cx.Rip = retAddr;
-                cx.Rax = 1;
-                return EXCEPTION_CONTINUE_EXECUTION;
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                Log("!!   0x12CAD0 forced-return read fault — unwind skipped");
-            }
-        }
-        if (rva == 0x11a4f3 && ep->ContextRecord) {
-            // gate (atiumd6a:0x12A420) crashes at +0xD3 for the same reason as 0x128680:
-            // [channel+0x80]=null → r14=0 → mov rax,[r14] faults.
-            // Identical prologue: same 6-push frame + sub rsp,0xA8 → same unwind offsets.
-            CONTEXT& cx = *ep->ContextRecord;
-            Log("!! gate+0xD3: forced-return; rsp=%p retaddr=%p",
-                (void*)cx.Rsp, (void*)*(ULONG_PTR*)(cx.Rsp + 0xD8));
-            __try {
-                cx.R15 = *(ULONG_PTR*)(cx.Rsp + 0xA8);
-                cx.R14 = *(ULONG_PTR*)(cx.Rsp + 0xB0);
-                cx.R12 = *(ULONG_PTR*)(cx.Rsp + 0xB8);
-                cx.Rsi = *(ULONG_PTR*)(cx.Rsp + 0xC0);
-                cx.Rbx = *(ULONG_PTR*)(cx.Rsp + 0xC8);
-                cx.Rbp = *(ULONG_PTR*)(cx.Rsp + 0xD0);
-                ULONG_PTR retAddr = *(ULONG_PTR*)(cx.Rsp + 0xD8);
-                cx.Rsp += 0xE0;
-                cx.Rip = retAddr;
-                cx.Rax = 1;
-                return EXCEPTION_CONTINUE_EXECUTION;
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                Log("!!   gate forced-return read fault — unwind skipped");
-            }
-        }
+        // The cleanup-path and [channel+0x10] crash fixups that used to live here were removed
+        // with the fake channel/state block: a crash in the driver now always means the harness
+        // failed to supply something real, and must be reported rather than steered around.
         if ((rva == 0x12cb06 || rva == 0x12cb23) && ep->ContextRecord) {
             // Crash inside flush — dump all GP regs to find null source.
             CONTEXT& cx = *ep->ContextRecord;
@@ -738,7 +1523,7 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep)
             Log("SUMMARY (early-exit): decoy hits=%zu (%zu decoys)",
                 g_decoyHits, g_decoys.size());
             Log("PROBE DONE (early-exit: unhandled crash during teardown)");
-            if (g_logFile) fflush(g_logFile);
+            // (WriteFile is unbuffered; no fflush needed)
         }
     }
     return EXCEPTION_CONTINUE_SEARCH;
@@ -808,6 +1593,22 @@ static bool CheckZone(void* user, const Live& l, const char* when)
 
 static LPVOID WINAPI Hook_HeapAlloc(HANDLE heap, DWORD flags, SIZE_T size)
 {
+#ifdef D3D9SHIM_DLL
+    if (g_inCreateResource) {
+        // Driver alloc during pfnCreateResource: give it a private VA region instead
+        // of an LFH heap block, so the Release-time fence faults only stale references
+        // to THIS allocation.  Recorded in g_createResourceAllocs as before (original
+        // size); census tracking is skipped -- the block never enters the heap.
+        SIZE_T vaSize = ((size ? size : 1) + 4095) & ~(SIZE_T)4095;
+        void* p = VirtualAlloc(nullptr, vaSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!p) return nullptr;
+        if (g_vmAllocsCount < 256)
+            g_vmAllocs[g_vmAllocsCount++] = VmAlloc{ p, size, false };
+        if (g_createResourceAllocsCount < 32)
+            g_createResourceAllocs[g_createResourceAllocsCount++] = DriverAlloc{ p, size };
+        return p;
+    }
+#endif
     bool zoned = g_redzone && heap == g_procHeap;
     void* p;
     if (zoned) {
@@ -837,12 +1638,23 @@ static LPVOID WINAPI Hook_HeapAlloc(HANDLE heap, DWORD flags, SIZE_T size)
         Log("  alloc %-7s %6zu bytes = %p  by %s", heap == g_procHeap ? "process" : "private", size, p,
             Where(_ReturnAddress(), w, sizeof w));
     }
+#ifdef D3D9SHIM_DLL
+    if (g_inCreateResource && g_createResourceAllocsCount < 32)
+        g_createResourceAllocs[g_createResourceAllocsCount++] = DriverAlloc{ p, size };
+#endif
     return p;
 }
 
 static BOOL WINAPI Hook_HeapFree(HANDLE heap, DWORD flags, LPVOID p)
 {
     if (!p) return TRUE;
+#ifdef D3D9SHIM_DLL
+    // VA-backed driver alloc (private page from the CreateResource redirect): never
+    // hand it to HeapFree, and do NOT VirtualFree it either -- Release fences the
+    // still-committed page after pfnDestroyResource.  Leaked by design (harness).
+    for (int _va = 0; _va < g_vmAllocsCount; _va++)
+        if (g_vmAllocs[_va].ptr == p) return TRUE;
+#endif
     Live l{};
     bool known = false;
     EnterCriticalSection(&g_cs);
@@ -858,6 +1670,14 @@ static BOOL WINAPI Hook_HeapFree(HANDLE heap, DWORD flags, LPVOID p)
         Log("  ** 152-byte-class block freed: %p (%zu bytes); contents at free:", p, l.size);
         HexDump("blk", p, l.size, l.size);
         LogStack("freed", 0, 10);
+#ifdef D3D9SHIM_DLL
+        void* inner48 = nullptr;
+        __try { inner48 = *(void**)((char*)p + 0x48); } __except(EXCEPTION_EXECUTE_HANDLER) {}
+        if (inner48 && (uintptr_t)inner48 > 0x10000) {
+            Log("  heap-free 152b: inner=%p -> arming watchpoint on inner+0x64", inner48);
+            ArmWriteWatchpoint((uintptr_t)inner48 + 0x64, p);
+        }
+#endif
     }
     if (known && l.zoned) {
         CheckZone(p, l, "on free");
@@ -868,6 +1688,10 @@ static BOOL WINAPI Hook_HeapFree(HANDLE heap, DWORD flags, LPVOID p)
 
 static SIZE_T WINAPI Hook_HeapSize(HANDLE heap, DWORD flags, LPCVOID p)
 {
+#ifdef D3D9SHIM_DLL
+    for (int _va = 0; _va < g_vmAllocsCount; _va++)
+        if (g_vmAllocs[_va].ptr == p) return g_vmAllocs[_va].size;
+#endif
     EnterCriticalSection(&g_cs);
     auto it = g_live.find((void*)p);
     bool zoned = it != g_live.end() && it->second.zoned;
@@ -878,6 +1702,27 @@ static SIZE_T WINAPI Hook_HeapSize(HANDLE heap, DWORD flags, LPCVOID p)
 
 static LPVOID WINAPI Hook_HeapReAlloc(HANDLE heap, DWORD flags, LPVOID p, SIZE_T size)
 {
+#ifdef D3D9SHIM_DLL
+    for (int _va = 0; _va < g_vmAllocsCount; _va++)
+        if (g_vmAllocs[_va].ptr == p) {
+            // VA-backed driver alloc: real HeapReAlloc would fail on the non-heap
+            // pointer.  Reallocate as a fresh private page and keep both tracking
+            // tables pointing at the new address.
+            if (flags & HEAP_REALLOC_IN_PLACE_ONLY) return nullptr;
+            SIZE_T vaSize = ((size ? size : 1) + 4095) & ~(SIZE_T)4095;
+            void* q = VirtualAlloc(nullptr, vaSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (!q) return nullptr;
+            SIZE_T oldSz = g_vmAllocs[_va].size;
+            memcpy(q, p, oldSz < size ? oldSz : size);
+            g_vmAllocs[_va] = VmAlloc{ q, size, false };
+            for (int _ca = 0; _ca < g_createResourceAllocsCount; _ca++)
+                if (g_createResourceAllocs[_ca].ptr == p) {
+                    g_createResourceAllocs[_ca] = DriverAlloc{ q, size };
+                    break;
+                }
+            return q;
+        }
+#endif
     EnterCriticalSection(&g_cs);
     auto it = g_live.find(p);
     bool known = it != g_live.end();
@@ -1102,6 +1947,7 @@ static void PrintSizeHistogram()
 
 static wchar_t g_driverDir[MAX_PATH];
 static bool g_kmtForward = false;
+static bool g_kmtFake    = false;  // --kmt-fake: return STATUS_SUCCESS with plausible fake output (no real GPU needed)
 static bool g_bpClear = false;    // --bp-clear: arm int3 at every atiumd6a +0x64 write site; logs rcx at each hit
 static bool g_forceFlush = false; // --force-flush: set [device+0x47B0]=1 before each draw to prod the deferred flush path
 static ULONG_PTR __stdcall StubRet0() { return 0; }
@@ -1114,10 +1960,35 @@ static ULONG_PTR s_fakeStateObj[4] = { 1, 0, 0, 0 };
 static ULONG_PTR __stdcall StubRetFakeStateObj() { return (ULONG_PTR)s_fakeStateObj; }
 static ULONG_PTR __stdcall StubRetFakeResource()  { return (ULONG_PTR)s_fakeResource; }
 
+// vtable slot 23 (offset +0xB8) on s_fakeSb80: 0x128680 calls it with rdx = an out-struct
+// on its own stack, then reads object pointers from [out+0x20] and [out+0x28] and calls
+// vtable slots on them.  A plain StubRet0 leaves those stack slots uninitialised (crash at
+// 0x1287a8, "mov r8,[rbx]").  Fill both with s_fakeSb80Out, whose vtable is s_stubVtbl
+// (all StubRet0), so the follow-on calls return 0 without crashing.
+static ULONG_PTR __stdcall StubFillSb80Out(ULONG_PTR, ULONG_PTR out, ULONG_PTR, ULONG_PTR) {
+    *(void**)(out + 0x20) = s_fakeSb80Out;
+    *(void**)(out + 0x28) = s_fakeSb80Out;
+    return 0;
+}
+
 // s_fakeChanAccumBuf: destination buffer for the per-frame accumulate call
 // (atiumd6a:0x4A400 calls fake_channel->vtable[7] to get this pointer, then passes
 // it as rcx to 0x46C30 which writes 11 qwords of accumulated deltas into [rcx+8..+88]).
 static uint8_t s_fakeChanAccumBuf[128];
+
+// s_fakeSb80: sub-object wired at [s_fakeSb+0x80] and [s_fakeChannel+0x80].
+// Three sites read a null [arg+0x80] and dereference it as a C++ object:
+//   atiumd6a:0x128680+0xD3  (rva 0x118753): mov rax,[r14]  r14=[rsi+0x80]
+//   atiumd6a:0x12A420+0xD3  (rva 0x11a4f3): mov rax,[r14]  r14=[rsi+0x80]
+//   atiumd6a:0x12CAD0+0xCF  (rva 0x11cb9f): mov rax,[r15]  r15=[r14+0x80]
+// With the sub-object provided, 0x128680 calls vtable slot 4 and early-exits (return 0)
+// unless it returns 1.  The VEH forced-return these replace handed back rax=1, so
+// slot 4 = StubRet1 to preserve that behaviour.
+// (s_fakeSb80 and s_fakeSb80Vtbl are forward-declared near the top of the file.)
+// The flush also passes [stateblock+0x80] to the selector 0x4BFA0, which reads
+// [s_fakeSb80+0xB0] and returns s_fakeSb80+0x00/+0x30/+0x60 as a C++ object; the
+// object must therefore be 0x100 bytes with the vtable at all three offsets and a
+// valid selector dword at +0xB0 (2, same trial value as s_fakeResource).
 
 // s_fakeResource: minimal fake texture-resource struct placed at s_fakeSb[+0x88] (and +0x98,
 // +0x28 etc.) so the bound-resource selector 0x4BFA0 doesn't crash reading [null+0xB0].
@@ -1167,7 +2038,7 @@ static uint8_t s_fakeTable[0x1800];
 // s_patchedSbVtbl / s_patchedSbVtblReady: forward-declared near the top of the file.
 // A copy of sb_vtbl_A with slot 5 → StubRet0 to skip the 0x13E260 crash.
 
-// 256-byte fake channel object: vtable ptr at [+0] points to s_fakeChanVtbl
+// 0x200-byte fake channel object: vtable ptr at [+0] points to s_fakeChanVtbl
 // Heap-allocated to avoid issues with static lifetime (declaration near top of file)
 
 static void InitFakeVtbls() {
@@ -1215,17 +2086,38 @@ static void InitFakeVtbls() {
     // Fake state block vtable
     *(void**)s_fakeSb = s_fakeStateVtbl;
 
+    // s_fakeSb80: all-StubRet0 vtable except slot 4 = StubRet1 (see declaration comment).
+    memset(s_fakeSb80, 0, sizeof s_fakeSb80);
+    for (int i = 0; i < 32; i++) s_fakeSb80Vtbl[i] = (void*)StubRet0;
+    s_fakeSb80Vtbl[4] = (void*)StubRet1;
+    s_fakeSb80Vtbl[23] = (void*)StubFillSb80Out;
+    *(void**)s_fakeSb80 = s_fakeSb80Vtbl;
+    // Selector 0x4BFA0 returns s_fakeSb80+0x00/+0x30/+0x60 depending on [+0xB0];
+    // each returned sub-object is called through its vtable, so set all three.
+    *(void**)(s_fakeSb80 + 0x30) = s_fakeSb80Vtbl;
+    *(void**)(s_fakeSb80 + 0x60) = s_fakeSb80Vtbl;
+    *(DWORD*)(s_fakeSb80 + 0xB0) = 2;
+    *(void**)s_fakeSb80Out = s_stubVtbl;
+    *(void**)(s_fakeSb + 0x80) = s_fakeSb80;
+    *(void**)(s_fakeSb + 0x110) = s_fakeSb110;
+
     // Fake texture resource: wired at s_fakeSb[+0x88] etc so the bound-resource selector
     // 0x4BFA0 doesn't crash reading [null+0xB0].  [+0xB0]=2 is a trial value; inner-object
     // pointer placed at all three possible selected+0x48 offsets (+0x48, +0x78, +0xA8) so
     // regardless of which of the three non-null return cases fires, [selected+0x48] is valid.
     memset(s_fakeResource,  0, sizeof s_fakeResource);
-    memset(s_fakeInner152,  0, sizeof s_fakeInner152);
+    // s_fakeInner152 is heap-allocated here (private heap so freed memory can't be reallocated by
+    // any other code).  stateApply(2) frees it and immediately reallocates to simulate reset freeing
+    // the texture inner object and another allocation reusing the freed slot.
+    if (!g_innerHeap)
+        g_innerHeap = HeapCreate(HEAP_NO_SERIALIZE, 0x40000, 0);
+    if (!s_fakeInner152)
+        s_fakeInner152 = (uint8_t*)HeapAlloc(g_innerHeap, HEAP_ZERO_MEMORY, 0x1200);
     // Fill every pointer-sized slot (0x08 to end) with s_fakeResource itself so any chain of
     // dereferences through the object stays non-null.  Specific overrides follow.
     for (int _r = 0x08; _r + 8 <= (int)sizeof s_fakeResource; _r += 8)
         *(void**)(s_fakeResource + _r) = s_fakeResource;
-    for (int _r = 0x08; _r + 8 <= (int)sizeof s_fakeInner152; _r += 8)
+    for (int _r = 0x08; _r + 8 <= 0x1200; _r += 8)
         *(void**)(s_fakeInner152 + _r) = s_fakeInner152;
     // s_fakeResourceVtbl: texture-resource vtable.  Slot 7 = StubRet1 so the initial gate
     // at flush+0x6D ("call [rbx_vtable+0x38]; test al,al; jz skip") passes (non-zero = valid).
@@ -1256,8 +2148,9 @@ static void InitFakeVtbls() {
     *(void**)s_fakeChan90Sub = s_stubVtbl;
     *(void**)(s_fakeChan90 + 0x20) = s_fakeChan90Sub;
 
-    // Fake channel: 256 bytes, vtable ptr at [+0]
-    s_fakeChannel = (uint8_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 256);
+    // Fake channel: 0x200 bytes, vtable ptr at [+0].  Must cover +0x110: the 0x128680
+    // epilogue destructor reads [channel+0x110] and dereferences it (0x61BD0/0x64030).
+    s_fakeChannel = (uint8_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 0x200);
     if (s_fakeChannel) *(void**)s_fakeChannel = s_fakeChanVtbl;
     s_fakeVtblsInited = true;
 }
@@ -1292,6 +2185,13 @@ static void InstallFakeChannel(HANDLE hDevice) {
     // Wire up [channel+0x10]: atiumd6a:0x13C950 reads [[channel+0x10]+0x70] for a vtable
     // object and calls vtable[+0xD0] on it.  s_fakeChan10 and s_fakeChan10Sub satisfy that.
     *(void**)(s_fakeChannel + 0x10) = s_fakeChan10;
+    // Wire [channel+0x80]: the flush helpers 0x128680 / 0x12A420 / 0x12CAD0 read
+    // [channel+0x80] (or [stateblock+0x80]) and dereference it as a C++ object.
+    *(void**)(s_fakeChannel + 0x80) = s_fakeSb80;
+    // Wire [channel+0x110]: 0x128680's epilogue destructor (0x257900) passes
+    // [channel+0x110] as rcx to 0x61BD0/0x64030, which read [rcx+0x58]/[+0x60].
+    // A zero-filled buffer makes both take their skip paths.
+    *(void**)(s_fakeChannel + 0x110) = s_fakeSb110;
     // Wire up [channel+0x28]: real state block with its vtable patched to s_fakeStateVtbl.
     // Using the real state block keeps real driver fields intact (texture slots at [+0x88]/[+0x98],
     // the texture-stage index at [+0x20], etc.) while letting us control all virtual calls on it.
@@ -1310,6 +2210,7 @@ static void InstallFakeChannel(HANDLE hDevice) {
             if (mbi.State == MEM_COMMIT &&
                 (mbi.Type == MEM_PRIVATE || mbi.Type == MEM_MAPPED) &&
                 (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) &&
+                !(mbi.Protect & PAGE_GUARD) &&
                 mbi.RegionSize >= 8) {
                 for (char* p = (char*)mbi.BaseAddress;
                      p + 8 <= (char*)mbi.BaseAddress + mbi.RegionSize;
@@ -1323,11 +2224,17 @@ static void InstallFakeChannel(HANDLE hDevice) {
                         __try { sb_from_dev = *(void**)((char*)p + 0x190); } __except(1) {}
                         Log("fake-channel: found device=%p → [+0x190]=%p", p, sb_from_dev);
                         if (sb_from_dev) {
-                            void* sb_v = nullptr;
-                            __try { sb_v = *(void**)sb_from_dev; } __except(1) {}
-                            if (sb_v == sb_vtable_A || sb_v == sb_vtable_B) {
-                                found_sb = sb_from_dev;
-                                Log("fake-channel: state_block from dev+0x190: %p vtbl=%p", found_sb, sb_v);
+                            MEMORY_BASIC_INFORMATION sb_mbi;
+                            bool sb_readable = VirtualQuery(sb_from_dev, &sb_mbi, sizeof sb_mbi) == sizeof sb_mbi
+                                            && sb_mbi.State == MEM_COMMIT
+                                            && (sb_mbi.Protect & (PAGE_READONLY|PAGE_READWRITE|PAGE_EXECUTE_READ|PAGE_EXECUTE_READWRITE));
+                            if (sb_readable) {
+                                void* sb_v = nullptr;
+                                __try { sb_v = *(void**)sb_from_dev; } __except(1) {}
+                                if (sb_v == sb_vtable_A || sb_v == sb_vtable_B) {
+                                    found_sb = sb_from_dev;
+                                    Log("fake-channel: state_block from dev+0x190: %p vtbl=%p", found_sb, sb_v);
+                                }
                             }
                         }
                     }
@@ -1354,12 +2261,35 @@ static void InstallFakeChannel(HANDLE hDevice) {
                 *(void**)((char*)found_sb + 0x88),
                 *(void**)((char*)found_sb + 0x98),
                 *(int*)((char*)found_sb + 0x20));
-            *(void**)(s_fakeChannel + 0x28) = found_sb;
-            Log("fake-channel: state_block wired → [chan+0x28]");
         } else {
-            Log("fake-channel: state_block not found — falling back to s_fakeSb");
-            *(void**)(s_fakeChannel + 0x28) = s_fakeSb;
+            Log("fake-channel: state_block not found — using s_fakeSb");
         }
+        // Always wire s_fakeSb, never found_sb: on a second call (post-Reset device recreate)
+        // the scan can find a stale or garbage address and the driver dereferences it before
+        // stateApply fires to re-wire s_fakeSb, crashing on the driver thread.
+        // Pre-initialise s_fakeSb so the driver survives the window before stateApply does
+        // the full re-setup: vtable + flush patch + texture slots (same shape stateApply makes).
+        *(void**)s_fakeSb = s_fakeStateVtbl;
+        if (!s_fakeVtblFlushPatched) {
+            HMODULE a6a = GetModuleHandleA("atiumd6a.dll");
+            if (a6a) {
+                s_realFlush = (char*)a6a + (0x13C950 - 0x10000);
+                s_fakeStateVtbl[4] = s_realFlush;
+                s_fakeStateVtbl[5] = (void*)StubRet0; // 0x13E260 → skip base-vtable crash
+                s_fakeVtblFlushPatched = true;
+                Log("fake-channel: s_fakeStateVtbl[4]=real flush %p, [5]=StubRet0", s_fakeStateVtbl[4]);
+            }
+        }
+        if (!*(void**)(s_fakeSb + 0x88)) {
+            for (int _off = 0x28; _off <= 0xBF; _off += 8)
+                *(void**)(s_fakeSb + _off) = s_fakeResource;
+            *(void**)(s_fakeSb + 0xA0) = nullptr;  // gate: [+0xA2] must stay 0
+        }
+        // Wired after the 0x28..0xBF fill above so the loop doesn't overwrite it.
+        *(void**)(s_fakeSb + 0x80) = s_fakeSb80;
+        *(void**)(s_fakeSb + 0x110) = s_fakeSb110;
+        *(void**)(s_fakeChannel + 0x28) = s_fakeSb;
+        Log("fake-channel: s_fakeSb pre-initialised and wired → [chan+0x28]");
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Log("fake-channel: exception during state_block vmem scan; using s_fakeSb");
         *(void**)(s_fakeChannel + 0x28) = s_fakeSb;
@@ -1375,11 +2305,60 @@ struct ThunkSlot { char name[64]; NTSTATUS(APIENTRY* real)(void*); };
 static ThunkSlot g_thunks[48];
 static int g_thunkCount = 0;
 
+// --kmt-fake: answer the driver's D3DKMT calls with STATUS_SUCCESS and just enough output for the
+// CPU-side draw path to run to the flush, without real hardware. Handles are a throwaway counter;
+// nothing needs tracking yet.
+static UINT32 s_nextFakeHandle = 1;
+static BYTE   s_fakeLockBuf[4096];
+
+static NTSTATUS FakeKmt(const char* name, void* arg)
+{
+    if (!strcmp(name, "D3DKMTCreateAllocation")) {
+        auto* p = (D3DKMT_CREATEALLOCATION*)arg;
+        if (p->pAllocationInfo) {
+            for (UINT i = 0; i < p->NumAllocations; i++)
+                p->pAllocationInfo[i].hAllocation = s_nextFakeHandle++;
+        }
+        p->hResource = s_nextFakeHandle++;
+        return (NTSTATUS)0;
+    }
+    if (!strcmp(name, "D3DKMTCreateSynchronizationObject")) {
+        auto* p = (D3DKMT_CREATESYNCHRONIZATIONOBJECT*)arg;
+        p->hSyncObject = s_nextFakeHandle++;
+        return (NTSTATUS)0;
+    }
+    if (!strcmp(name, "D3DKMTRender")) {
+        // Refuse the actual GPU submission: the driver bails out before spinning on a fence
+        // that the fake GPU would never signal. The deferred flush (and the clear write) has
+        // already run before this call, so refusing here is safe and avoids an infinite wait.
+        return (NTSTATUS)0xC00000BB; // STATUS_NOT_SUPPORTED
+    }
+    if (!strcmp(name, "D3DKMTLock")) {
+        auto* p = (D3DKMT_LOCK*)arg;
+        p->pData = s_fakeLockBuf;
+        return (NTSTATUS)0;
+    }
+    // DestroyAllocation, DestroySynchronizationObject, SignalSynchronizationObject,
+    // WaitForSynchronizationObject, Escape, Unlock, and everything else: succeed and leave it at that.
+    return (NTSTATUS)0;
+}
+
 template <int N>
 static NTSTATUS APIENTRY ThunkWrapper(void* arg)
 {
-    NTSTATUS s = g_kmtForward ? g_thunks[N].real(arg) : (NTSTATUS)0xC00000BB; // STATUS_NOT_SUPPORTED
-    Log("  km %s(%p) = %08lx%s", g_thunks[N].name, arg, s, g_kmtForward ? "" : " [refused, not forwarded]");
+    NTSTATUS s;
+    const char* tag;
+    if (g_kmtForward) {
+        s   = g_thunks[N].real(arg);
+        tag = "";
+    } else if (g_kmtFake) {
+        s   = FakeKmt(g_thunks[N].name, arg);
+        tag = " [fake]";
+    } else {
+        s   = (NTSTATUS)0xC00000BB; // STATUS_NOT_SUPPORTED
+        tag = " [refused, not forwarded]";
+    }
+    Log("  km %s(%p) = %08lx%s", g_thunks[N].name, arg, s, tag);
     LogStack(g_thunks[N].name);
     return s;
 }
@@ -1413,34 +2392,80 @@ static FARPROC WINAPI Hook_GetProcAddress(HMODULE mod, LPCSTR name)
 // A sibling DLL the driver asks for by bare name is taken from the driver's own folder when it exists there.
 static HMODULE LoadSibling(const wchar_t* name, DWORD flags)
 {
-    const wchar_t* base = wcsrchr(name, L'\\');
-    base = base ? base + 1 : name;
-    wchar_t local[MAX_PATH];
-    swprintf_s(local, L"%s\\%s", g_driverDir, base);
-    HMODULE h = nullptr;
-    bool sibling = GetFileAttributesW(local) != INVALID_FILE_ATTRIBUTES;
-    if (sibling) h = LoadLibraryExW(local, nullptr, 0);
-    if (!h) h = LoadLibraryExW(name, nullptr, flags);
-    Log("  LoadLibrary(\"%ls\") = %p%s", name, (void*)h, sibling && h ? " [from the driver folder]" : "");
-    if (h && sibling) {
-        HookImports(h);
-        if (g_bpClear && _wcsicmp(base, L"atiumd6a.dll") == 0) {
-            Log("bp-clear: atiumd6a.dll at %p; arming clear write sites + caller gates", (void*)h);
-            // Clear write sites (the actual +0x64 writes): RVA = VA_preferred - 0x10000
-            ArmBp(h, 0x12EA32, "clear.A"); // path A write:  0x13EA32
-            ArmBp(h, 0x12E946, "clrzero"); // call site for memset(inner_obj,0,0x1000); cap r8=0 before the call
-            ArmBp(h, 0x0F44EC, "clear.B"); // path B write:  0x1044EC
-            ArmBp(h, 0x0F7305, "clear.1"); // new write:     0x107305
-            ArmBp(h, 0x1EBD09, "clear.2"); // new write:     0x1FBD09
-            ArmBp(h, 0x1FED70, "clear.3"); // new write:     0x20ED70
-            // Caller-level gates: do these functions even get called?
-            ArmBp(h, 0x12C950, "flush");   // state-flush function 0x13C950 (contains clear calls)
-            ArmBp(h, 0x12E260, "relobj");  // virtual call target that crashes at +0x31 ([rdi+8]=-1)
-            ArmBp(h, 0x0F4520, "tss.disp");// TSS dispatcher 0x104520 (path B caller)
-            ArmBp(h, 0x11A420, "gate");    // sub_12A420 (the gate condition for the clear)
-        }
+    // Null guard before any dereference
+    if (!name) {
+        Log("  LoadSibling: null name, skipping");
+        return nullptr;
     }
-    return h;
+    __try {
+    const wchar_t* base = wcsrchr(name, L'\\');
+        base = base ? base + 1 : name;
+        // Use WideCharToMultiByte for safe logging: avoids %ls crash on bad pointer
+        char safen[MAX_PATH * 2 + 4] = "(bad)";
+        char safeb[MAX_PATH * 2 + 4] = "(bad)";
+        WideCharToMultiByte(CP_ACP, 0, name, -1, safen, (int)sizeof safen, nullptr, nullptr);
+        WideCharToMultiByte(CP_ACP, 0, base, -1, safeb, (int)sizeof safeb, nullptr, nullptr);
+        char safedir[MAX_PATH * 2 + 4] = "(bad)";
+        WideCharToMultiByte(CP_ACP, 0, g_driverDir, -1, safedir, (int)sizeof safedir, nullptr, nullptr);
+        Log("  LoadSibling: name='%s' base='%s' driverDir='%s'", safen, safeb, g_driverDir[0] ? safedir : "(empty)");
+        wchar_t local[MAX_PATH];
+        HMODULE h = nullptr;
+        bool sibling = false;
+        if (g_driverDir[0] && base && base[0]) {
+        swprintf_s(local, L"%s\\%s", g_driverDir, base);
+            sibling = GetFileAttributesW(local) != INVALID_FILE_ATTRIBUTES;
+            if (sibling) h = LoadLibraryExW(local, nullptr, 0);
+        }
+        if (!h) h = LoadLibraryExW(name, nullptr, flags);
+    Log("  LoadLibrary(\"%s\") = %p%s", safen, (void*)h, sibling && h ? " [from the driver folder]" : "");
+        if (h && sibling) {
+            HookImports(h);
+#ifdef D3D9SHIM_DLL
+            if (_wcsicmp(base, L"atiumd6a.dll") == 0) {
+                // Diagnostic: arm the object-factory BPs as soon as atiumd6a is in memory,
+                // before the driver can call them during OpenAdapter/CreateDevice.
+                ArmBp(h, 0x009430, "mmobj.make");   // creates [settings+0x5028]
+                ArmBp(h, 0x003710, "chan.make");    // creates [holder+0x20] (channel)
+                ArmBp(h, 0x002180, "st.flush");     // atiumd6a state-flush entry
+                ArmBp(h, 0x009482, "mmobj.init");     // post-init call: eax = init result
+                ArmBp(h, 0x085370, "cap.read");       // engine-caps file reader: r8d = engine id
+                ArmBp(h, 0x0022F8, "st.br22f8");      // 0x2180: states-differ branch (real flush)
+                ArmBp(h, 0x00241A, "st.br241a");      // 0x2180: same-state branch
+                ArmBp(h, 0x0024EF, "st.skip");        // 0x2180: skip (no flush)
+                ArmBp(h, 0x002435, "st.r14p90");      // 0x2180: MOV RAX,[R14+0x90] (null check)
+                ArmBp(h, 0x00BAA5, "st.baa5");        // vtable fn: TEST RBX,RBX before [RBX+8] deref
+                ArmBp(h, 0x001850, "st.b1850");       // inner resource binder called with [entry+0x08]
+                ArmBp(h, 0x002450, "st.ret244a");     // 0x2180: return point after vtable CALL at 0x244A
+                ArmBp(h, 0x00BAEF, "st.baef");        // vtable fn: RBX=0 path
+                ArmBp(h, 0x002405, "st.call38");      // 0x2180: [[chan+0x28]+0x18] vt+0x38 call
+                ArmBp(h, 0x002496, "st.call20");      // 0x2180: [chan+0x28] vt+0x20 call
+                ArmBp(h, 0x002499, "st.ret2496");     // 0x2180: return point after st.call20
+                ArmBp(h, 0x001EE7, "st.dfcall");      // 0x1D30: indirect submit call via [a6a+0x82EA28]
+                ArmBp(h, 0x001EED, "st.dfret");       // 0x1D30: return point of that call
+                ArmBp(h, 0x00244A, "st.callc0");      // 0x2180: vtable call [rax+0xc0]
+            }
+#endif
+            if (g_bpClear && _wcsicmp(base, L"atiumd6a.dll") == 0) {
+                Log("bp-clear: atiumd6a.dll at %p; arming clear write sites + caller gates", (void*)h);
+                // Clear write sites (the actual +0x64 writes): RVA = VA_preferred - 0x10000
+                ArmBp(h, 0x12EA32, "clear.A"); // path A write:  0x13EA32
+                ArmBp(h, 0x12E946, "clrzero"); // call site for memset(inner_obj,0,0x1000); cap r8=0 before the call
+                ArmBp(h, 0x0F44EC, "clear.B"); // path B write:  0x1044EC
+                ArmBp(h, 0x0F7305, "clear.1"); // new write:     0x107305
+                ArmBp(h, 0x1EBD09, "clear.2"); // new write:     0x1FBD09
+                ArmBp(h, 0x1FED70, "clear.3"); // new write:     0x20ED70
+                // Caller-level gates: do these functions even get called?
+                ArmBp(h, 0x12C950, "flush");   // state-flush function 0x13C950 (contains clear calls)
+                ArmBp(h, 0x12E260, "relobj");  // virtual call target that crashes at +0x31 ([rdi+8]=-1)
+                ArmBp(h, 0x0F4520, "tss.disp");// TSS dispatcher 0x104520 (path B caller)
+                ArmBp(h, 0x11A420, "gate");    // sub_12A420 (the gate condition for the clear)
+            }
+        }
+        return h;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("  LoadSibling: exception in body, loading original without sibling check");
+        return LoadLibraryExW(name, nullptr, flags);
+    }
 }
 
 static HMODULE WINAPI Hook_LoadLibraryW(LPCWSTR name) { return LoadSibling(name, 0); }
@@ -1460,6 +2485,97 @@ static HMODULE WINAPI Hook_LoadLibraryExA(LPCSTR name, HANDLE, DWORD flags)
 
 static void WINAPI Hook_OutputDebugStringA(LPCSTR s) { Log("  driver says: %s", s ? s : "(null)"); }
 
+// ---------------------------------------------------------------- atiumd6a.cap emulation
+//
+// The driver's engine discovery (atiumd6a:0x85370 counting, 0x85730 parsing) reads a
+// capabilities file "atiumd6a.cap" from the system directory. The 2015 package shipped
+// it next to the driver; it is data, not code, and it is absent here, so the file APIs
+// are answered for that one path with an in-memory file. The format, recovered from
+// 0x85370: a 0x20-byte plaintext header (magic 0x02010F01 at +4, index entry size at +8,
+// engine record size at +0xC, index count at +0x10, default index at +0x14), then an
+// index of 0x10-byte records {id, start, ?, end}, then engine records. Everything past
+// the header is XOR-obfuscated: key 0x86ACD572, advancing by 0x5742AF69 per dword.
+// Engine records are counted into two arrays by 0x85370: a record whose [0x88] equals
+// the header's first dword (or -1) is counted, into out1 when its [4] is nonzero.
+
+static const HANDLE kFakeCapHandle = (HANDLE)(ULONG_PTR)0xCA990001;
+static uint64_t g_fakeCapPos = 0;
+static bool g_fakeCapBuilt = false;
+static uint8_t g_fakeCap[0x100];
+static size_t g_fakeCapSize = 0;
+
+static void BuildFakeCap()
+{
+    if (g_fakeCapBuilt) return;
+    g_fakeCapBuilt = true;
+    memset(g_fakeCap, 0, sizeof g_fakeCap);
+    auto put32 = [&](size_t off, uint32_t v) { memcpy(g_fakeCap + off, &v, 4); };
+    put32(0x00, 1);           // version dword; engine record [0x88] must equal it to be counted
+    put32(0x04, 0x02010F01);  // magic
+    put32(0x08, 0x10);        // index entry size
+    put32(0x0C, 0x90);        // engine record size
+    put32(0x10, 1);           // index entry count
+    put32(0x14, 0);           // default index
+    uint32_t key = 0x86ACD572;
+    auto putX = [&](size_t off, uint32_t v) { put32(off, v ^ key); key += 0x5742AF69; };
+    putX(0x20, 0);            // index[0].id = 0
+    putX(0x24, 0);            // index[0].start = 0
+    putX(0x28, 0);            // index[0].?
+    putX(0x2C, 0);            // index[0].end = 0  (one engine record)
+    for (size_t i = 0; i < 0x90 / 4; i++) putX(0x30 + i * 4, (i == 1 || i == 0x88 / 4) ? 1 : 0);
+    g_fakeCapSize = 0x30 + 0x90;
+}
+
+static HANDLE WINAPI Hook_CreateFileA(LPCSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa,
+                                      DWORD disp, DWORD flags, HANDLE tmpl)
+{
+    if (name) {
+        const char* base = strrchr(name, '\\');
+        base = base ? base + 1 : name;
+        if (_stricmp(base, "atiumd6a.cap") == 0) {
+            BuildFakeCap();
+            g_fakeCapPos = 0;
+            Log("  cap: CreateFileA(\"%s\") answered with the in-memory capabilities file", name);
+            return kFakeCapHandle;
+        }
+    }
+    return CreateFileA(name, access, share, sa, disp, flags, tmpl);
+}
+
+static BOOL WINAPI Hook_ReadFile(HANDLE h, LPVOID buf, DWORD n, LPDWORD nread, LPOVERLAPPED ov)
+{
+    if (h == kFakeCapHandle) {
+        size_t left = g_fakeCapSize > g_fakeCapPos ? g_fakeCapSize - (size_t)g_fakeCapPos : 0;
+        DWORD got = (DWORD)(n < left ? n : left);
+        if (got) memcpy(buf, g_fakeCap + g_fakeCapPos, got);
+        g_fakeCapPos += got;
+        if (nread) *nread = got;
+        return TRUE;
+    }
+    return ReadFile(h, buf, n, nread, ov);
+}
+
+static DWORD WINAPI Hook_SetFilePointer(HANDLE h, LONG dist, PLONG high, DWORD method)
+{
+    if (h == kFakeCapHandle) {
+        int64_t base = method == FILE_BEGIN ? 0
+                     : method == FILE_CURRENT ? (int64_t)g_fakeCapPos
+                     : (int64_t)g_fakeCapSize;
+        int64_t np = base + dist;
+        if (np < 0) np = 0;
+        g_fakeCapPos = (uint64_t)np;
+        if (high) *high = (LONG)(g_fakeCapPos >> 32);
+        return (DWORD)g_fakeCapPos;
+    }
+    return SetFilePointer(h, dist, high, method);
+}
+
+static BOOL WINAPI Hook_CloseHandle(HANDLE h)
+{
+    if (h == kFakeCapHandle) return TRUE;
+    return CloseHandle(h);
+}
+
 struct ImportHook { const char* name; void* hook; };
 static const ImportHook g_importHooks[] = {
     { "HeapAlloc", (void*)Hook_HeapAlloc },       { "HeapFree", (void*)Hook_HeapFree },
@@ -1469,6 +2585,8 @@ static const ImportHook g_importHooks[] = {
     { "LoadLibraryA", (void*)Hook_LoadLibraryA }, { "LoadLibraryW", (void*)Hook_LoadLibraryW },
     { "LoadLibraryExA", (void*)Hook_LoadLibraryExA }, { "LoadLibraryExW", (void*)Hook_LoadLibraryExW },
     { "OutputDebugStringA", (void*)Hook_OutputDebugStringA },
+    { "CreateFileA", (void*)Hook_CreateFileA },       { "ReadFile", (void*)Hook_ReadFile },
+    { "SetFilePointer", (void*)Hook_SetFilePointer }, { "CloseHandle", (void*)Hook_CloseHandle },
 };
 
 static void HookImports(HMODULE mod)
@@ -1600,6 +2718,18 @@ static HRESULT APIENTRY CALLBACK QueryAdapterInfoCb(HANDLE hAdapter, CONST D3DDD
             if (n > r.len) n = r.len;
             memset((char*)p->pPrivateDriverData + r.off, (int)r.byte, n);
         }
+    // The record carries the adapter's registry path as a NUL-terminated string at +0xE8 (the driver
+    // compares it against "SYSTEM" at atiumd64+0x199F, and atiumd6a's device init searches it for
+    // "SYSTEM"/"SOFTWARE" before it will build its device objects; an empty string makes the init
+    // return failure and the whole channel/state path stays dark). The kernel would supply this on
+    // real hardware, so invent it the same way as the other record fields.
+    {
+        static const char kRegPath[] =
+            "\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Control\\Class"
+            "\\{4d36e968-e325-11ce-bfc1-08002be10318}\\0000";
+        if (0xE8 + sizeof kRegPath <= p->PrivateDriverDataSize)
+            memcpy((char*)p->pPrivateDriverData + 0xE8, kRegPath, sizeof kRegPath);
+    }
     for (auto& s : g_qaiSet)
         if (s.first + 4 <= p->PrivateDriverDataSize) memcpy((char*)p->pPrivateDriverData + s.first, &s.second, 4);
     Log("    answered the %u-byte record with 0x%02x, %zu fill ranges and %zu invented fields (--qai-set)",
@@ -1928,6 +3058,46 @@ static HRESULT APIENTRY CALLBACK DevSignalSyncCb(HANDLE hDevice, CONST D3DDDICB_
 {
     (void)hDevice;
     Log("  cb SignalSynchronizationObjectCb(%u objects) = S_OK", p->ObjectCount);
+    return S_OK;
+}
+
+// The 2-variants take the fence value explicitly; the fence words handed out by DevCreateSync2Cb are
+// already past every value the driver can wait for, so these complete at once like the non-2 versions.
+static HRESULT APIENTRY CALLBACK DevWaitSync2Cb(HANDLE hDevice, CONST D3DDDICB_WAITFORSYNCHRONIZATIONOBJECT2* p)
+{
+    (void)hDevice;
+    if (g_wpInnerPtr) {
+        char* probe = (char*)g_wpInnerPtr + 0x64;
+        // If the probe target sits on a fenced bait page, the probe itself would fault and
+        // be logged as a FENCE UAF from our own module -- that is instrumentation noise,
+        // not a driver UAF.  Skip it; the driver's own deref of the bait is the detection.
+        uintptr_t probePage = (uintptr_t)g_wpInnerPtr & ~(uintptr_t)0xFFF;
+        bool fenced = false;
+        PoolLock();
+        for (int _i = 0; _i < g_fencedCount; _i++)
+            if ((uintptr_t)g_fenced[_i].page_base == probePage) { fenced = true; break; }
+        PoolUnlock();
+        if (fenced) {
+            Log("shim: DevWaitSync2Cb: probe skipped, %p is on a fenced bait page", (void*)probePage);
+        } else {
+            Log("shim: DevWaitSync2Cb: UAF probe write at %p (g_wpInnerPtr=%p)", probe, g_wpInnerPtr);
+            __try {
+                *(volatile ULONG_PTR*)probe = 0;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                Log("shim: DevWaitSync2Cb: probe except %08lx (VEH logged FENCE UAF)", GetExceptionCode());
+            }
+        }
+        g_wpInnerPtr = nullptr;
+    }
+    Log("  cb WaitForSynchronizationObject2Cb(%u objects, fence=%llu) = S_OK",
+        p ? p->ObjectCount : 0u, p ? (unsigned long long)p->FenceValue : 0ull);
+    return S_OK;
+}
+
+static HRESULT APIENTRY CALLBACK DevSignalSync2Cb(HANDLE hDevice, CONST D3DDDICB_SIGNALSYNCHRONIZATIONOBJECT2* p)
+{
+    (void)hDevice;
+    Log("  cb SignalSynchronizationObject2Cb(%u objects) = S_OK", p->ObjectCount);
     return S_OK;
 }
 
@@ -2265,6 +3435,8 @@ static void FillDeviceCallbacks(D3DDDI_DEVICECALLBACKS* cb)
     cb->pfnCreateContextVirtualCb = DevCreateContextVirtualCb;
     cb->pfnSubmitCommandCb = DevSubmitCommandCb;
     cb->pfnCreateSynchronizationObject2Cb = DevCreateSync2Cb;
+    cb->pfnWaitForSynchronizationObject2Cb = DevWaitSync2Cb;
+    cb->pfnSignalSynchronizationObject2Cb = DevSignalSync2Cb;
     cb->pfnWaitForSynchronizationObjectFromCpuCb = DevWaitSyncFromCpuCb;
     cb->pfnSignalSynchronizationObjectFromCpuCb = DevSignalSyncFromCpuCb;
     cb->pfnWaitForSynchronizationObjectFromGpuCb = DevWaitSyncFromGpuCb;
@@ -2296,18 +3468,13 @@ static size_t g_wlOk = 0, g_wlFailed = 0, g_wlMissing = 0;
 static bool g_wlDangle = false; // --workload-dangle: destroy a bound texture without unbinding it first
 static bool g_wlStaleDraw = false; // --workload-stale-draw: after destroy, issue another draw before the next bind
 static bool g_wlReset = false; // --workload-reset: between iterations, run the device-lost/Reset DDI sequence
+static int  g_passiveWatchSec = 0; // --passive-watch N: arm BPs on the already-loaded atiumd6a.dll, wait N seconds
 static bool g_hwTest = false;      // --hw-test: real-hardware fix verification (implies --kmt-forward --qai-forward
                                    // --bp-clear --device --workload --workload-dangle --workload-stale-draw).
                                    // PASS/FAIL is based on g_clearAHits rather than decoy writes.
                                    // Bug proof: expect hits > 0.  Fix proof (+ --workload-fix-unbind): expect 0.
 static bool g_wlFixUnbind = false; // --workload-fix-unbind: unbind all stages immediately before each DestroyResource,
                                    // modelling the fix applied to MPCVR and the built-in renderer.
-                                   // LIMITATION: does NOT suppress decoy hits when used with --bp-clear --fake-draw-params.
-                                   // The fake channel routes draws through s_fakeSb, a static block wired by the stateApply
-                                   // BP handler independently of the real driver state. pfnSetTexture(null) clears the real
-                                   // stage flag [stage+0x90] but not s_fakeSb, so the clear write fires regardless.
-                                   // Fix correctness is verified analytically: sub_13E8D0 checks [stage+0x90] before the
-                                   // write, and pfnSetTexture(null) zeroes it. Runtime proof requires real TeraScale hw.
 
 static void WlResult(const char* what, HRESULT hr)
 {
@@ -2537,8 +3704,9 @@ static void RunWorkload(HANDLE hDevice, D3DDDI_DEVICEFUNCS* df, size_t rounds)
             // bound so the next round's bind-and-draw sequence runs through the dangling pointer.
             if (!g_wlDangle && df->pfnSetTexture)
                 for (UINT s = 0; s < 8; s++) WlResult("SetTexture(N, unbind)", df->pfnSetTexture(hDevice, s, nullptr));
-            if (g_wlFixUnbind && df->pfnSetTexture)
+            if (g_wlFixUnbind && df->pfnSetTexture) {
                 for (UINT s = 0; s < 8; s++) WlResult("SetTexture(N, fix-unbind)", df->pfnSetTexture(hDevice, s, nullptr));
+            }
             if (df->pfnDestroyResource) {
                 WlResult("DestroyResource", df->pfnDestroyResource(hDevice, hTex));
                 tracked.erase(std::find(tracked.begin(), tracked.end(), hTex));
@@ -2607,8 +3775,9 @@ static void RunWorkloadBatch(HANDLE hDevice, D3DDDI_DEVICEFUNCS* df, size_t batc
 
         if (!g_wlDangle && df->pfnSetTexture)
             for (UINT s = 0; s < 8; s++) WlResult("SetTexture(N, unbind)", df->pfnSetTexture(hDevice, s, nullptr));
-        if (g_wlFixUnbind && df->pfnSetTexture)
+        if (g_wlFixUnbind && df->pfnSetTexture) {
             for (UINT s = 0; s < 8; s++) WlResult("SetTexture(N, fix-unbind)", df->pfnSetTexture(hDevice, s, nullptr));
+        }
         for (HANDLE h : live) {
             if (df->pfnDestroyResource) {
                 WlResult("DestroyResource", df->pfnDestroyResource(hDevice, h));
@@ -2655,6 +3824,9 @@ static void TryCaps(const D3DDDI_ADAPTERFUNCS& f, HANDLE hDrv, const char* name,
     if (SUCCEEDED(hr)) HexDump(name, buf.data(), size, 64);
 }
 
+// The d3d9 shim build brings its own entry point; wmain stays for the exe and the injectable probe,
+// whose Legacy9Run calls it.
+#if !defined(D3D9SHIM_DLL)
 int wmain(int argc, wchar_t** argv)
 {
     const wchar_t* dll = nullptr;
@@ -2732,6 +3904,14 @@ int wmain(int argc, wchar_t** argv)
             }
         }
         else if (!wcscmp(argv[i], L"--kmt-forward")) g_kmtForward = true;
+        else if (!wcscmp(argv[i], L"--kmt-fake")) g_kmtFake = true;
+        else if (!wcscmp(argv[i], L"--passive-watch") && i + 1 < argc) {
+            // Arm clear BPs on the already-loaded atiumd6a.dll (injected into a live player), wait N
+            // seconds, then print the clear.A hit count. No fake device is created; MPCVR's own draws
+            // trigger the BPs. Useful for confirming the bug fires naturally from a Reset / format change.
+            g_passiveWatchSec = _wtoi(argv[++i]);
+            g_bpClear = true;
+        }
         else if (!wcscmp(argv[i], L"--hw-test")) {
             // Real-hardware fix verification. Implies everything needed to reach atiumd6a's clear path
             // via the native GPU draw pipeline. Use --workload-fix-unbind alongside to test the fix.
@@ -2794,8 +3974,8 @@ int wmain(int argc, wchar_t** argv)
 
     // Opened so it can be read while the probe is still running, which matters when the host is a long-lived
     // process such as the player.
-    if (g_logFile) { fclose(g_logFile); g_logFile = nullptr; }
-    g_logFile = _wfsopen(logPath, L"w", _SH_DENYWR);
+    if (g_logHandle != INVALID_HANDLE_VALUE) { CloseHandle(g_logHandle); g_logHandle = INVALID_HANDLE_VALUE; }
+    g_logHandle = CreateFileW(logPath, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     InitializeCriticalSection(&g_cs);
     g_procHeap = GetProcessHeap();
     AddVectoredExceptionHandler(1, CrashFilter);
@@ -2843,6 +4023,38 @@ int wmain(int argc, wchar_t** argv)
         // A detector that cannot see planted damage makes every later result meaningless, so the rounds are
         // skipped; the run still reports, so the failure is visible rather than silent.
         if (!selfTestPassed) { rc = 4; rounds = 0; }
+    }
+
+    if (g_passiveWatchSec > 0) {
+        // Passive-watch mode: arm BPs on atiumd6a.dll already in this process (MPCVR loaded it),
+        // wait for the player to trigger a Reset or format change, then report clear.A hits.
+        // No fake device is created; this is purely observational.
+        HMODULE aMod = LoadLibraryExW(full, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        if (aMod) HookImports(aMod);
+        HMODULE a6a = GetModuleHandleW(L"atiumd6a.dll");
+        if (a6a) {
+            Log("passive-watch: atiumd6a.dll at %p; arming clear write sites + caller gates", (void*)a6a);
+            ArmBp(a6a, 0x12EA32, "clear.A");
+            ArmBp(a6a, 0x12E946, "clrzero");
+            ArmBp(a6a, 0x0F44EC, "clear.B");
+            ArmBp(a6a, 0x0F7305, "clear.1");
+            ArmBp(a6a, 0x1EBD09, "clear.2");
+            ArmBp(a6a, 0x1FED70, "clear.3");
+            ArmBp(a6a, 0x12C950, "flush");
+            ArmBp(a6a, 0x12E260, "relobj");
+            ArmBp(a6a, 0x0F4520, "tss.disp");
+            ArmBp(a6a, 0x11A420, "gate");
+        } else {
+            Log("passive-watch: atiumd6a.dll not found in process; BPs not armed (player may not use this driver)");
+        }
+        Log("passive-watch: watching for %d seconds -- trigger a format change or seek in the player now",
+            g_passiveWatchSec);
+        Sleep((DWORD)(g_passiveWatchSec * 1000));
+        Log("SUMMARY: clear.A hits=%zu", g_clearAHits);
+        if (g_clearAHits > 0) Log("PROBE DONE (passive-watch: clear.A fired %zu times -- bug confirmed)", g_clearAHits);
+        else                  Log("PROBE DONE (passive-watch: clean -- no clear.A hits in %ds)", g_passiveWatchSec);
+        // (WriteFile is unbuffered; no fflush needed)
+        return rc;
     }
 
     if (rounds) Checkpoint("before load");
@@ -3053,7 +4265,7 @@ int wmain(int argc, wchar_t** argv)
                         } else {
                             Log("PROBE DONE");
                         }
-                        if (g_logFile) fflush(g_logFile);
+                        // (WriteFile is unbuffered; no fflush needed)
                     }
                     if (df->pfnDestroyDevice) {
                         HRESULT ddhr = df->pfnDestroyDevice(cd.hDevice);
@@ -3141,9 +4353,10 @@ int wmain(int argc, wchar_t** argv)
     }
 
     Log("PROBE DONE");
-    if (g_logFile) { fclose(g_logFile); g_logFile = nullptr; }
+    if (g_logHandle != INVALID_HANDLE_VALUE) { CloseHandle(g_logHandle); g_logHandle = INVALID_HANDLE_VALUE; }
     return rc;
 }
+#endif // !D3D9SHIM_DLL
 
 #ifdef LEGACY9_DLL
 // Built as a DLL as well, so the probe can run inside another process: there the driver's process heap really is
@@ -3176,11 +4389,11 @@ extern "C" __declspec(dllexport) DWORD WINAPI Legacy9Run(LPVOID)
     LPWSTR* argv = CommandLineToArgvW(cmd, &argc);
     if (!argv) return 1;
     // A log is opened before anything can fail, so a bad options line still leaves a trace in the host process.
-    if (!g_logFile) {
+    if (g_logHandle == INVALID_HANDLE_VALUE) {
         wchar_t path[MAX_PATH];
         GetModuleFileNameW(g_self, path, MAX_PATH);
         if (wchar_t* dot = wcsrchr(path, L'.')) wcscpy_s(dot, MAX_PATH - (dot - path), L"-startup.log");
-        g_logFile = _wfsopen(path, L"w", _SH_DENYWR);
+        g_logHandle = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         Log("Legacy9Run in pid %lu with options: %ls", GetCurrentProcessId(), cmd);
     }
     return (DWORD)wmain(argc, argv);
