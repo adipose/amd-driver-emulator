@@ -35,16 +35,14 @@
 #        resource's [hRes+0x48] and arms a hardware watchpoint on inner+0x64
 #        (the clear.A write target).  A hit is logged as "REAL UAF WRITE".
 #
-# CURRENT STATE (2026-11-20): the driver is driven through its whole device
-# chain (channel, mm-device, engine objects) and renders through the immediate
-# pipeline with real command submissions.  The deferred state flush fires
-# (recorder -> 0x2DE9A -> stateApply -> atiumd6a:0x2180) but the state
-# snapshots it compares are never populated: the flush takes the 0x241a branch
-# and skips at 0x24ef because [snapshot+0x1A0] is 0 and the snapshot carries
-# no texture-stage bindings.  So the clear.A write path never runs and the
-# test FAILS honestly (see the wall analysis in the worktree notes).
+# CURRENT STATE (2026-11-22): PASSES on 15.7.1.  OLD faults on a fenced page at
+# atiumd6a+0x1856, a read (cmp qword [rcx+8],0) of a texture released while
+# still bound to stage 0.  NEW fences more pages and runs more flushes with no
+# fault.  The clear.A +0x64 write path itself still never runs, so the
+# watchpoint (mechanism 2) has not fired and what is proven is the stale use
+# of the freed texture, not the write.
 #
-# PASS = OLD observes a UAF write (either mechanism) with evidence, NEW does not.
+# PASS = OLD observes a use after free (either mechanism) with evidence, NEW does not.
 #
 # Prerequisites:
 #   MPCVR must run the D3D9 path.  Set once before running:
@@ -146,7 +144,7 @@ function Invoke-Case {
         if ($fenceLine) { Write-Host "  FENCE UAF : $($fenceLine.Line.Trim())" }
         if ($wpLine)    { Write-Host "  WATCHPNT  : $($wpLine.Line.Trim())" }
     } else {
-        Write-Host "  UAF WRITE : none"
+        Write-Host "  UAF       : none"
     }
     if ($boundLine)  { Write-Host "  Bound@rel : $($boundLine.Line.Trim())" }
     Write-Host "  Fenced    : $twCount driverAlloc pages fenced$(if ($zozLine) { "  (ZERO-OF-ZERO seen: $($zozLine.Line.Trim()))" })"
@@ -155,7 +153,7 @@ function Invoke-Case {
 
     $pass = $true
     if ($expectUaf -and -not $uafFound) {
-        Write-Host "  FAIL: expected a UAF write but none seen"
+        Write-Host "  FAIL: expected a use after free but none seen"
         if (-not $boundLine) {
             Write-Host "        (no STILL BOUND line -- no texture was seen released while bound,"
             Write-Host "         so the UAF condition never arose in this run; result is inconclusive)"
@@ -175,7 +173,7 @@ function Invoke-Case {
         $pass = $false
     }
     if (-not $expectUaf -and $uafFound) {
-        Write-Host "  FAIL: unexpected UAF write (fix did not suppress the UAF)"
+        Write-Host "  FAIL: unexpected use after free (fix did not suppress the UAF)"
         $pass = $false
     }
     if ($pass) { Write-Host "  PASS" }

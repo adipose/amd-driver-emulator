@@ -67,6 +67,15 @@ static int         g_createResourceAllocsCount = 0;
 struct VmAlloc { void* ptr; SIZE_T size; bool fenced; };
 static VmAlloc g_vmAllocs[256] = {};
 static int     g_vmAllocsCount = 0;
+// sa.gatechk recursion-break: sub.retSA offset in atiumd64 (version-driven; the
+// default is the 15.7.1 value).  Declared before the legacy9.cpp include because
+// the included code references it.
+static DWORD g_gcRetSA = 0x520E2;
+// Defined after the include; the LoadSibling hook in legacy9.cpp uses it to gate
+// its build-specific atiumd6a diagnostic arms.
+static DWORD GetModuleMinorBuild(HMODULE mod);
+// Defined after the include; arms the version-driven early atiumd6a BPs.
+static void ShimArmEarlyA6a(HMODULE a6a);
 #include "legacy9.cpp"  // infrastructure; wmain suppressed
 
 // ---------------------------------------------------------------- driver bring-up
@@ -81,44 +90,158 @@ static void* g_shimDevFuncs[512] = {};
 static FakeContext g_shimContext;
 static HWND g_shimFocusWnd = nullptr;
 
+// Version-driven BP table.  The RVAs below were pre-computed per driver build
+// (14.4 / 15.7.1 / 16.2.1); an RVA of 0 means "not armed for this build".
+struct BpSet {
+    DWORD a64minor;
+    // atiumd64 BPs
+    DWORD stateApply, saGatechk, gateCall, gateRet;
+    DWORD deferRun, deferFlush, drawPipe, drawRec;
+    DWORD subResolved, subCallSA, subRetSA;
+    DWORD recWrap0, recWrap1, recWrap2, recWrap3;
+    DWORD snapCall, snapBuild, snapStages;
+    DWORD stCrash64, clrInner, clrPath2, clrDispatch;
+    // atiumd6a BPs
+    DWORD clearA, stUaf, stSub24e0, clrZero, flushRva;
+    DWORD tssDisp, gateA6a, bcCase, bcClearfn;
+    // early-arm RVAs for ShimCreateDevice
+    DWORD stFlushEarly;   // atiumd6a stateApply-a6a
+    DWORD clrZeroEarly;   // atiumd6a clrzero early
+    // sa.gatechk recursion-break: sub.retSA address in atiumd64
+    DWORD gcRetSA;
+};
+
+static DWORD GetModuleMinorBuild(HMODULE mod) {
+    wchar_t path[MAX_PATH];
+    if (!GetModuleFileNameW(mod, path, MAX_PATH)) return 0;
+    DWORD dummy;
+    DWORD sz = GetFileVersionInfoSizeW(path, &dummy);
+    if (!sz || sz > 65536) return 0;
+    static BYTE buf[65536];
+    if (!GetFileVersionInfoW(path, 0, sz, buf)) return 0;
+    VS_FIXEDFILEINFO* ffi = nullptr;
+    UINT ffiSz = 0;
+    if (!VerQueryValueW(buf, L"\\", (LPVOID*)&ffi, &ffiSz) || !ffi) return 0;
+    // File versions are 9.14.10.NNNN: the distinguishing build (1029/1128/1171)
+    // is the fourth component, LOWORD(dwFileVersionLS).
+    return LOWORD(ffi->dwFileVersionLS);
+}
+
+static const BpSet g_bpSets[] = {
+    // 14.4: atiumd64 build 1029
+    { 1029,
+      0x31220, 0x31244, 0x30F43, 0x30F45,
+      0x2EC9A, 0x2EC40, 0x363C0, 0,
+      0,       0,       0,
+      0, 0, 0, 0,
+      0, 0, 0,
+      0, 0, 0, 0,
+      0x0F4A6D, 0, 0, 0, 0,
+      0, 0, 0, 0,
+      0x1BA0, 0,
+      0
+    },
+    // 15.7.1: atiumd64 build 1128
+    { 1128,
+      0x30310, 0x30334, 0x30053, 0x30055,
+      0x2DE9A, 0x2DE40, 0x35470, 0x2CCE0,
+      0x51DFD, 0x520DD, 0x520E2,
+      0x0A0E2, 0x0B140, 0x511E2, 0x13090,
+      0x2D8C70, 0x1712A0, 0x176CBB,
+      0x59827, 0x596D0, 0x597DC, 0x53180,
+      0x12EA32, 0x12E90F, 0x0024E0, 0x12E946, 0x12C950,
+      0x0F4520, 0x11A420, 0x124777, 0x12E8D0,
+      0x2180, 0x12E946,
+      0x520E2
+    },
+    // 16.2.1: atiumd64 build 1171
+    { 1171,
+      0x311F0, 0x31214, 0x30F53, 0x30F55,
+      0,       0,       0x36170, 0,
+      0,       0x0538BD,0x0538C2,
+      0, 0, 0, 0,
+      0, 0, 0,
+      0, 0, 0, 0,
+      0x1453D2,0x1452AF,0, 0, 0,
+      0, 0, 0, 0x145270,
+      0x2180, 0,
+      0x0538C2
+    },
+};
+static const int g_bpSetsCount = 3;
+
+static const BpSet* GetBpSet() {
+    if (!g_shimMod) return nullptr;
+    DWORD minor = GetModuleMinorBuild(g_shimMod);
+    Log("shim: atiumd64 minor build = %lu", (unsigned long)minor);
+    for (int i = 0; i < g_bpSetsCount; i++)
+        if (g_bpSets[i].a64minor == minor) return &g_bpSets[i];
+    Log("shim: WARNING -- no BP table for build %lu, falling back to 15.7.1", (unsigned long)minor);
+    for (int i = 0; i < g_bpSetsCount; i++)
+        if (g_bpSets[i].a64minor == 1128) return &g_bpSets[i];
+    return nullptr;
+}
+
+// Arms the version-driven early atiumd6a BPs (st.flush/clrzero).  Called from the
+// LoadSibling hook the moment atiumd6a.dll is mapped -- the driver's own LoadLibrary
+// happens during OpenAdapter, after ShimCreateDevice's early-arm block has already
+// run, so this is the only point that is actually early.
+static void ShimArmEarlyA6a(HMODULE a6a)
+{
+    const BpSet* bps = GetBpSet();
+    DWORD czRva = bps ? bps->clrZeroEarly : 0x12E946;
+    DWORD sfRva = bps ? bps->stFlushEarly  : 0x2180;
+    if (czRva) ArmBp(a6a, czRva, "clrzero");
+    if (sfRva) ArmBp(a6a, sfRva, "st.flush");
+}
+
 // Arms the breakpoints that trace the clear-write path. Called once after device creation and again on
 // ResetEx: the module image survives a device reset, so a re-arm only matters if a BP was left restored.
 static void ShimArmBps()
 {
-    ArmBp(g_shimMod, 0x30310, "stateApply");
-    ArmBp(g_shimMod, 0x30334, "sa.gatechk");  // stateApply: [rbp+0x1B8] null check (gate skip)
-    ArmBp(g_shimMod, 0x30053, "gate.call");   // gate: about to call rax -> atiumd6a:0x2180
-    ArmBp(g_shimMod, 0x30055, "gate.ret");    // gate: rax call returned
-    ArmBp(g_shimMod, 0x51DFD, "sub.resolved");// 0x51D80: both 0x26020 resolves done (rsi/rdi)
-    ArmBp(g_shimMod, 0x520DD, "sub.callSA");  // 0x51D80: call 0x30310 (stateApply recursion)
-    ArmBp(g_shimMod, 0x520E2, "sub.retSA");   // 0x51D80: stateApply call returned
-    ArmBp(g_shimMod, 0x2DE9A, "defer.run");
-    ArmBp(g_shimMod, 0x2DE40, "deferFlush");   // the deferred-flush gate itself
-    ArmBp(g_shimMod, 0x35470, "draw.pipe");
-    ArmBp(g_shimMod, 0x2CCE0, "draw.rec");
-    ArmBp(g_shimMod, 0x0A0E2, "rec.wrap0");
-    ArmBp(g_shimMod, 0x0B140, "rec.wrap1");
-    ArmBp(g_shimMod, 0x511E2, "rec.wrap2");
-    ArmBp(g_shimMod, 0x13090, "rec.wrap3");
-    ArmBp(g_shimMod, 0x2D8C70, "snap.call");
-    ArmBp(g_shimMod, 0x1712A0, "snap.build");
-    ArmBp(g_shimMod, 0x176CBB, "snap.stages");
-    ArmBp(g_shimMod, 0x59827, "st.crash64");  // atiumd64 crash site (reads -1 from hw register)
-    ArmBp(g_shimMod, 0x596D0, "clr.inner");   // atiumd64:0x596D0 entry (inner clear fn)
-    ArmBp(g_shimMod, 0x597DC, "clr.path2");   // atiumd64:0x597DC path-2 call site
-    ArmBp(g_shimMod, 0x53180, "clr.dispatch");// atiumd64:0x53180 dispatch loop entry
+    const BpSet* bps = GetBpSet();
+    if (!bps) { ShimHookPool(); return; }
+#define ABP(mod, rva, tag) do { if (rva) ArmBp((mod), (rva), (tag)); } while(0)
+    ABP(g_shimMod, bps->stateApply,  "stateApply");
+    ABP(g_shimMod, bps->saGatechk,   "sa.gatechk");
+    ABP(g_shimMod, bps->gateCall,    "gate.call");
+    ABP(g_shimMod, bps->gateRet,     "gate.ret");
+    ABP(g_shimMod, bps->subResolved, "sub.resolved");
+    ABP(g_shimMod, bps->subCallSA,   "sub.callSA");
+    ABP(g_shimMod, bps->subRetSA,    "sub.retSA");
+    ABP(g_shimMod, bps->deferRun,    "defer.run");
+    ABP(g_shimMod, bps->deferFlush,  "deferFlush");
+    ABP(g_shimMod, bps->drawPipe,    "draw.pipe");
+    ABP(g_shimMod, bps->drawRec,     "draw.rec");
+    ABP(g_shimMod, bps->recWrap0,    "rec.wrap0");
+    ABP(g_shimMod, bps->recWrap1,    "rec.wrap1");
+    ABP(g_shimMod, bps->recWrap2,    "rec.wrap2");
+    ABP(g_shimMod, bps->recWrap3,    "rec.wrap3");
+    ABP(g_shimMod, bps->snapCall,    "snap.call");
+    ABP(g_shimMod, bps->snapBuild,   "snap.build");
+    ABP(g_shimMod, bps->snapStages,  "snap.stages");
+    ABP(g_shimMod, bps->stCrash64,   "st.crash64");
+    ABP(g_shimMod, bps->clrInner,    "clr.inner");
+    ABP(g_shimMod, bps->clrPath2,    "clr.path2");
+    ABP(g_shimMod, bps->clrDispatch, "clr.dispatch");
     HMODULE a6a = GetModuleHandleA("atiumd6a.dll");
     if (a6a) {
-        ArmBp(a6a, 0x12EA32, "clear.A");
-        ArmBp(a6a, 0x12E90F, "st.uaf");       // UAF write function entry
-        ArmBp(a6a, 0x0024E0, "st.sub24e0");    // command-submit vtable call
-        ArmBp(a6a, 0x12E946, "clrzero");
-        ArmBp(a6a, 0x12C950, "flush");
-        ArmBp(a6a, 0x0F4520, "tss.disp");
-        ArmBp(a6a, 0x11A420, "gate");
-        ArmBp(a6a, 0x124777, "bc.case");      // bytecode case handler that calls 0x12C950
-        ArmBp(a6a, 0x12E8D0, "bc.clearfn");   // function containing clear.A (0x12EA32)
+        ABP(a6a, bps->clearA,    "clear.A");
+        ABP(a6a, bps->stUaf,     "st.uaf");
+        ABP(a6a, bps->stSub24e0, "st.sub24e0");
+        ABP(a6a, bps->clrZero,   "clrzero");
+        ABP(a6a, bps->flushRva,  "flush");
+        ABP(a6a, bps->tssDisp,   "tss.disp");
+        ABP(a6a, bps->gateA6a,   "gate");
+        ABP(a6a, bps->bcCase,    "bc.case");
+        ABP(a6a, bps->bcClearfn, "bc.clearfn");
     }
+#undef ABP
+    g_gcRetSA = bps->gcRetSA;
+    Log("shim: g_gcRetSA = 0x%x (sub.retSA for sa.gatechk recursion break)", g_gcRetSA);
+    g_phaseResetAtGateRet = (bps->deferRun == 0);
+    if (g_phaseResetAtGateRet)
+        Log("shim: no defer.run for this build -- BIND/UNBIND phase resets at gate.ret");
     ShimHookPool();
 }
 
@@ -262,10 +385,15 @@ static HRESULT ShimCreateDevice(HWND hFocusWnd)
 
     // Diagnostic: atiumd64-side creators/destructor for the atiumd6a device objects,
     // armed before OpenAdapter/CreateDevice so we see them if they run there.
+    // These RVAs are the 15.7.1 (build 1128) addresses; on any other build they can
+    // land mid-instruction, where the 0xCC silently corrupts an operand instead of
+    // trapping, so arm them only there.
+    if (GetModuleMinorBuild(g_shimMod) == 1128) {
     ArmBp(g_shimMod, 0x1E959, "mmdev.make");  // creates [settings+0x5028] (lazy)
     ArmBp(g_shimMod, 0x1CF0,  "holder.make"); // creates [dev_inner+0x600] holder
     ArmBp(g_shimMod, 0x1E9F0, "mmdev.free");
     ArmBp(g_shimMod, 0x1E9C8, "mmdev.done");  // 0x1E959's store of [settings+0x5028]
+    }
 
     // Arm clrzero before CreateDevice: the driver's initialization runs the
     // memset(inner_obj,0,0x1000) path that overflows the 152-byte inner block into
@@ -274,10 +402,13 @@ static HRESULT ShimCreateDevice(HWND hFocusWnd)
     {
         HMODULE a6a_early = GetModuleHandleA("atiumd6a.dll");
         if (a6a_early) {
-            ArmBp(a6a_early, 0x12E946, "clrzero");
+            const BpSet* early_bps = GetBpSet();
+            DWORD czRva  = early_bps ? early_bps->clrZeroEarly : 0x12E946;
+            DWORD sfRva  = early_bps ? early_bps->stFlushEarly  : 0x2180;
+            if (czRva) ArmBp(a6a_early, czRva,    "clrzero");
             ArmBp(a6a_early, 0x009430, "mmobj.make");   // creates [settings+0x5028]
             ArmBp(a6a_early, 0x003710, "chan.make");    // creates [holder+0x20] (channel)
-            ArmBp(a6a_early, 0x002180, "st.flush");     // atiumd6a state-flush entry
+            if (sfRva) ArmBp(a6a_early, sfRva,    "st.flush");     // atiumd6a state-flush entry
             ArmBp(a6a_early, 0x009482, "mmobj.init");   // logs the variant's vtable, records it for the plant
             if (g_plant710465) {
                 ArmBp(a6a_early, 0x037510, "crash.fn");

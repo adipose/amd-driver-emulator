@@ -142,6 +142,10 @@ static int s_phase = 0;
 // Stop flag: set when clear.A fires so the UNBIND injection stops re-arming the
 // stage record and the BIND/UNBIND loop terminates instead of cycling forever.
 static bool s_clearFired = false;
+// Version-driven (set by the shim's ShimArmBps from the BP table): builds without a
+// defer.run RVA (16.2.1) run one synchronous stateApply per flush, so the
+// BIND->UNBIND phase machine is restarted at gate.ret instead of defer.run.
+static bool g_phaseResetAtGateRet = false;
 static uint8_t s_nullRes[64] = {};   // non-null sentinel for UNBIND fn_1850 main path
 static void*   s_vtblObj = nullptr;  // vtable caller obj saved at BIND for state injection
 // Zeroed stand-in for the per-resource backing object the deep flush writes into.
@@ -179,13 +183,13 @@ static void LogFramesFrom(CONTEXT* c, int frames)
 #ifdef D3D9SHIM_DLL
 #include "legacy9_pool.cpp"
 #else
-// Stubs for the shim-only pool hook and draw-commit table: the BP handlers and callbacks
-// below reference them unconditionally, but the exe/hook builds carry no pool
-// instrumentation, so give them empty stand-ins to keep the file self-contained.
+// Standalone build: the pool/fence globals live in legacy9_pool.cpp (shim-only) and
+// g_drawCommittedHRes lives in d3d9shim.cpp.  The BP handler bodies that reference
+// them are dead code here (the shim arms those tags), so inert fallbacks suffice.
 static void PoolLock() {}
 static void PoolUnlock() {}
 struct FencedBlock { void* page_base; void* obj_ptr; SIZE_T obj_size; bool triggered; };
-static FencedBlock g_fenced[256];
+static FencedBlock g_fenced[256] = {};
 static int g_fencedCount = 0;
 static HANDLE g_drawCommittedHRes[16] = {};
 #endif
@@ -958,7 +962,7 @@ static void OnBp(EXCEPTION_POINTERS* ep)
                 // 5 pushes + sub rsp,0x40 in stateApply's prologue: caller's return
                 // address lives at [rsp+0x68] here.
                 void* retaddr = *(void**)((char*)ep->ContextRecord->Rsp + 0x68);
-                if (s_a64b && retaddr == (void*)((char*)s_a64b + 0x520E2)) {
+                if (s_a64b && g_gcRetSA && retaddr == (void*)((char*)s_a64b + g_gcRetSA)) {
                     void* rbp = (void*)ep->ContextRecord->Rbp;
                     void* old = rbp ? *(void**)((char*)rbp + 0x1B8) : nullptr;
                     if (rbp && old) {
@@ -982,6 +986,9 @@ static void OnBp(EXCEPTION_POINTERS* ep)
             } __except (EXCEPTION_EXECUTE_HANDLER) {}
         } else if (!strcmp(b.tag, "gate.ret")) {
             Log("       gate.ret: flush returned eax=%08x", (unsigned)ep->ContextRecord->Rax);
+            // Builds without defer.run (16.2.1: one synchronous stateApply per flush)
+            // restart the BIND->UNBIND injection sequence here, once per flush cycle.
+            if (g_phaseResetAtGateRet) { s_phase = 0; s_clearFired = false; }
         } else if (!strcmp(b.tag, "sub.resolved")) {
             // 0x51D80+0x7D: rsi/rdi = the two objects resolved from record+0x48/+0x58.
             // stateApply is about to be re-entered with these; their +0x1B8 links decide
@@ -2465,6 +2472,17 @@ static HMODULE LoadSibling(const wchar_t* name, DWORD flags)
             if (_wcsicmp(base, L"atiumd6a.dll") == 0) {
                 // Diagnostic: arm the object-factory BPs as soon as atiumd6a is in memory,
                 // before the driver can call them during OpenAdapter/CreateDevice.
+                // These RVAs are the 15.7.1 (a6a build 513) addresses.  On any other build
+                // they can land mid-instruction, and a BP restore+single-step there would
+                // execute corrupted code, so skip the whole list.
+                DWORD a6aMinor = GetModuleMinorBuild(h);
+                if (a6aMinor != 513) {
+                    Log("  LoadSibling: atiumd6a minor build = %lu -- skipping 15.7.1 diagnostic arms",
+                        (unsigned long)a6aMinor);
+                    // The version-driven early BPs are still valid for this build.
+                    ShimArmEarlyA6a(h);
+                } else {
+                ArmBp(h, 0x009430, "mmobj.make");   // creates [settings+0x5028]
                 ArmBp(h, 0x003710, "chan.make");    // creates [holder+0x20] (channel)
                 ArmBp(h, 0x002180, "st.flush");     // atiumd6a state-flush entry
                 ArmBp(h, 0x085370, "cap.read");       // engine-caps file reader: r8d = engine id
@@ -2482,6 +2500,7 @@ static HMODULE LoadSibling(const wchar_t* name, DWORD flags)
                 ArmBp(h, 0x001EE7, "st.dfcall");      // 0x1D30: indirect submit call via [a6a+0x82EA28]
                 ArmBp(h, 0x001EED, "st.dfret");       // 0x1D30: return point of that call
                 ArmBp(h, 0x00244A, "st.callc0");      // 0x2180: vtable call [rax+0xc0]
+                }
             }
 #endif
             if (g_bpClear && _wcsicmp(base, L"atiumd6a.dll") == 0) {
