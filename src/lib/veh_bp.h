@@ -19,7 +19,7 @@ struct Bp { uintptr_t addr; unsigned char orig; const char* tag; };
 // wild 152-byte-class writes, and a heap-allocated bp table lands in that size class — a
 // stray zeroing wiped the vector's buffer mid-flush (every entry read back as zero, so the
 // gate bp surfaced as an unhandled int3 inside pfnFlush).  Static storage can't be a victim.
-static Bp g_bps[32];
+static Bp g_bps[96];
 static size_t g_bpsCount = 0;
 static uintptr_t g_rearm = 0; // address to re-arm when the single-step after a breakpoint lands
 

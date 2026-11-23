@@ -21,7 +21,7 @@ static BOOL CALLBACK PoolCsInit(PINIT_ONCE, PVOID, PVOID*) { InitializeCriticalS
 static void PoolLock() { InitOnceExecuteOnce(&g_poolCsOnce, PoolCsInit, nullptr, nullptr); EnterCriticalSection(&g_poolCs); }
 static void PoolUnlock() { LeaveCriticalSection(&g_poolCs); }
 
-struct FencedBlock { void* page_base; void* obj_ptr; bool triggered; };
+struct FencedBlock { void* page_base; void* obj_ptr; SIZE_T obj_size; bool triggered; };
 static FencedBlock g_fenced[256];
 static int         g_fencedCount = 0;
 
@@ -175,7 +175,7 @@ static void* HookPoolAlloc(void* a0, void* a1, ULONG_PTR a2, ULONG_PTR a3)
     g_poolFreeOrig(a0, orig, a2, a3);
     PoolLock();
     if (g_fencedCount < 256) {
-        g_fenced[g_fencedCount++] = FencedBlock{ page, page, false };
+        g_fenced[g_fencedCount++] = FencedBlock{ page, page, 4096, false };
     }
     PoolUnlock();
     Log("pool: alloc 0x98 -> fence page %p (orig %p freed back)", page, orig);
