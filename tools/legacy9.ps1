@@ -32,9 +32,14 @@ if ($NoDriver) {
 } else {
     $resolved = & (Join-Path $PSScriptRoot 'Find-LegacyDriver.ps1') -Path $Dll
     if (-not $resolved) { throw 'no legacy driver found: put atiumd64.dll in drivers\ or set MPC_TEST_AMDUMD (see drivers\README.md)' }
-    # The fields the 2015 driver checks in the adapter record before it will open: record size, family 8, and a
-    # chip id and revision in the TeraScale range. Without them OpenAdapter faults.
-    $argv += @('--dll', $resolved, '--qai-set', '0=0x260,0x3c=8,0x30=0x5a,0x34=0x3c', '--rounds', $Rounds)
+    # Minimal QAI fields for OpenAdapter and CreateDevice (see README.md "Faking the hardware"):
+    #   first record:  size, family/chip, revision, flags (0x80=WDDM2, 0x400=second query), ring/engine count
+    #   second record: memory-size gates and command-buffer manager flags
+    $argv += @('--dll', $resolved,
+        '--qai-set',  '0=0x260,0x3c=8,0x30=0x5a,0x34=0x3c,0x1f4=0x480,0xd4=2',
+        '--qai-set2', '0x2a00=1,0x2a04=1,0x2c2c=1,0x2c30=1',
+        '--gpu-va-base', '0x20000',
+        '--rounds', $Rounds)
 }
 if ($Redzone)     { $argv += '--redzone' }
 if ($TraceAllocs) { $argv += '--trace-allocs' }

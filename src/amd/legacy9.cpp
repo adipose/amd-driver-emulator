@@ -109,6 +109,7 @@ static void PrintSizeHistogram();
 
 // Forward declarations used in the BP handler below (defined later in the file).
 static size_t g_clearAHits = 0;   // clear.A BP hit count; used by --hw-test PASS/FAIL
+static void* volatile g_mmobjForCrash = nullptr; // mmobj the crash injection targets (set at mmobj.init)
 static uint8_t* s_fakeChannel;
 static void* s_fakeStateVtbl[64];
 static void* s_fakeResourceVtbl[64]; // vtable for s_fakeResource: slot 7 = StubRet1 (texture gate)
@@ -176,6 +177,16 @@ static void LogFramesFrom(CONTEXT* c, int frames)
 
 #ifdef D3D9SHIM_DLL
 #include "legacy9_pool.cpp"
+#else
+// Stubs for the shim-only pool hook and draw-commit table: the BP handlers and callbacks
+// below reference them unconditionally, but the exe/hook builds carry no pool
+// instrumentation, so give them empty stand-ins to keep the file self-contained.
+static void PoolLock() {}
+static void PoolUnlock() {}
+struct FencedBlock { void* page_base; void* obj_ptr; SIZE_T obj_size; bool triggered; };
+static FencedBlock g_fenced[256];
+static int g_fencedCount = 0;
+static HANDLE g_drawCommittedHRes[16] = {};
 #endif
 
 static void OnBp(EXCEPTION_POINTERS* ep)
@@ -491,9 +502,28 @@ static void OnBp(EXCEPTION_POINTERS* ep)
             Log("       mmdev.free: settings=%p [+0x5028]=%p", (void*)ep->ContextRecord->Rcx,
                 (void*)ep->ContextRecord->Rcx);
         } else if (!strcmp(b.tag, "mmobj.init")) {
-            // At atiumd6a+0x9482: eax = init() result; 1 means the object is kept.
-            Log("       mmobj.init: init returned %d (rbx=%p)",
-                (int)ep->ContextRecord->Rax, (void*)ep->ContextRecord->Rbx);
+            // At atiumd6a+0x9482: eax = init() result; 1 means the object is kept. rbx is the new
+            // object; [rbx] is its vtable, which identifies the variant (the #4257 crash object has
+            // its vtable at atiumd6a RVA 0x2CEB90; the OpenAdapter variant at 0x4A2B68).
+            void* vt = nullptr;
+            __try { vt = *(void**)ep->ContextRecord->Rbx; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            char wv[128];
+            Log("       mmobj.init: init returned %d (rbx=%p vtable=%p %s)",
+                (int)ep->ContextRecord->Rax, (void*)ep->ContextRecord->Rbx, vt,
+                vt ? Where(vt, wv, sizeof wv) : "(unreadable)");
+            // init == 1 keeps the object, which is the branch whose destructor later runs
+            // vtable+0x40 (crash.fn). Remember it so the workload can plant the bad pointer.
+            if ((int)ep->ContextRecord->Rax == 1)
+                g_mmobjForCrash = (void*)ep->ContextRecord->Rbx;
+        } else if (!strcmp(b.tag, "crash.fn")) {
+            // atiumd6a:0x37510 — the crash vtable's slot+0x40. The field crash is the read of
+            // [obj+0x68] at +0x7A (0x3758A); log the object and that field before it happens.
+            void* obj = (void*)ep->ContextRecord->Rcx;
+            void* f68 = nullptr;
+            __try { f68 = *(void**)((char*)obj + 0x68); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            char wv[128];
+            Log("       crash.fn: obj=%p [obj+0x68]=%p %s", obj, f68,
+                f68 ? Where(f68, wv, sizeof wv) : "(null)");
         } else if (!strcmp(b.tag, "init.ok") || !strcmp(b.tag, "init.fail")) {
             Log("       %s: rbp+0x20=%x rbp+0x30=%x", b.tag,
                 *(unsigned*)(ep->ContextRecord->Rbp + 0x20),
@@ -2420,14 +2450,20 @@ static HMODULE LoadSibling(const wchar_t* name, DWORD flags)
     Log("  LoadLibrary(\"%s\") = %p%s", safen, (void*)h, sibling && h ? " [from the driver folder]" : "");
         if (h && sibling) {
             HookImports(h);
+            if (_wcsicmp(base, L"atiumd6a.dll") == 0) {
+                // Object-factory BPs in both builds: which mmobj variant gets created is the
+                // question in the standalone probe too (crash object: vtable atiumd6a RVA 0x2CEB90).
+                ArmBp(h, 0x009430, "mmobj.make");   // creates [settings+0x5028]
+                ArmBp(h, 0x009482, "mmobj.init");     // post-init call: eax = init result
+                ArmBp(h, 0x037510, "crash.fn");       // crash vtable's slot+0x40: reads [obj+0x68]
+                ArmBp(h, 0x0094D0, "dtor.a6a");       // field crash path through the factory's dtor
+            }
 #ifdef D3D9SHIM_DLL
             if (_wcsicmp(base, L"atiumd6a.dll") == 0) {
                 // Diagnostic: arm the object-factory BPs as soon as atiumd6a is in memory,
                 // before the driver can call them during OpenAdapter/CreateDevice.
-                ArmBp(h, 0x009430, "mmobj.make");   // creates [settings+0x5028]
                 ArmBp(h, 0x003710, "chan.make");    // creates [holder+0x20] (channel)
                 ArmBp(h, 0x002180, "st.flush");     // atiumd6a state-flush entry
-                ArmBp(h, 0x009482, "mmobj.init");     // post-init call: eax = init result
                 ArmBp(h, 0x085370, "cap.read");       // engine-caps file reader: r8d = engine id
                 ArmBp(h, 0x0022F8, "st.br22f8");      // 0x2180: states-differ branch (real flush)
                 ArmBp(h, 0x00241A, "st.br241a");      // 0x2180: same-state branch
@@ -4076,6 +4112,13 @@ int wmain(int argc, wchar_t** argv)
         ApplyPatches(mod);
         Checkpoint(at("after load"));
 
+        // Arm the teardown-path BPs before OpenAdapter: the mmobj factory runs during OpenAdapter,
+        // so arming in the device phase (the g_breakpoints block below) misses the creation store.
+        if (g_breakpoints) {
+            ArmBp(mod, 0x1E9C8, "mmdev.done");  // store of the mmobj factory result to [settings+0x5028]
+            ArmBp(mod, 0x94E3,  "dtor.field");  // the field crash's destroy caller (atiumd64+0x94E3)
+        }
+
         if (!closeOnly) {
             auto open = (PFN_OPENADAPTER)GetProcAddress(mod, "OpenAdapter");
             if (!open) { Log("no OpenAdapter export"); return 1; }
@@ -4266,6 +4309,48 @@ int wmain(int argc, wchar_t** argv)
                             Log("PROBE DONE");
                         }
                         // (WriteFile is unbuffered; no fflush needed)
+                    }
+                    // Try to trigger the crashing mmobj creation by issuing a CreateResource.
+                    // The field crash object (vtable atiumd6a RVA 0x2CEB90) is made by the same
+                    // factory that runs during CreateDevice, but only once real rendering work
+                    // reaches the driver. One 1x1 A8R8G8B8 texture is the smallest such call.
+                    if (df->pfnCreateResource) {
+                        D3DDDI_SURFACEINFO surf = {};
+                        surf.Width  = 1;
+                        surf.Height = 1;
+                        surf.Depth  = 1;
+                        D3DDDIARG_CREATERESOURCE cr = {};
+                        cr.hResource = (HANDLE)0x40000;  // fake runtime handle; the driver may replace it
+                        cr.Format = D3DDDIFMT_A8R8G8B8;
+                        cr.Pool = D3DDDIPOOL_VIDEOMEMORY;
+                        cr.MultisampleType = D3DDDIMULTISAMPLE_NONE;
+                        cr.pSurfList = &surf;
+                        cr.SurfCount = 1;
+                        cr.MipLevels = 1;
+                        cr.Flags.Texture = 1;
+                        cr.Rotation = D3DDDI_ROTATION_IDENTITY;
+                        HRESULT crhr = df->pfnCreateResource(cd.hDevice, &cr);
+                        Log("  pfnCreateResource = %08lx  hResource=%p", crhr, (void*)cr.hResource);
+                        if (SUCCEEDED(crhr) && g_mmobjForCrash) {
+                            // Inject the bad pointer: write an 8-byte value at obj+0x64 so the
+                            // destructor at vtable+0x40 (crash.fn) reads obj+0x68 as a bad address.
+                            // The real crash has a 64-bit pointer stored at +0x64 (not +0x60 or
+                            // +0x68), so obj+0x68 reads the HIGH 4 bytes of that value = a
+                            // non-canonical address.
+                            uint8_t* obj = (uint8_t*)g_mmobjForCrash;
+                            *(uint64_t*)(obj + 0x64) = 0x00000001DEADBEEFULL;
+                            Log("  injected bad pointer at obj+0x64: obj=%p [obj+0x68] now 0x00000001DEADBEEF as qword",
+                                g_mmobjForCrash);
+                            g_mmobjForCrash = nullptr;
+                        }
+                        // If it succeeded, also destroy it: the field crash is on the teardown path
+                        // (atiumd64+0x94E3 -> atiumd6a:0x94D0 -> vtable+0x40).
+                        if (SUCCEEDED(crhr) && df->pfnDestroyResource) {
+                            HRESULT dres = df->pfnDestroyResource(cd.hDevice, cr.hResource);
+                            Log("  pfnDestroyResource = %08lx", dres);
+                        }
+                    } else {
+                        Log("  the driver filled no pfnCreateResource");
                     }
                     if (df->pfnDestroyDevice) {
                         HRESULT ddhr = df->pfnDestroyDevice(cd.hDevice);
