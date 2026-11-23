@@ -110,6 +110,7 @@ static void PrintSizeHistogram();
 // Forward declarations used in the BP handler below (defined later in the file).
 static size_t g_clearAHits = 0;   // clear.A BP hit count; used by --hw-test PASS/FAIL
 static void* volatile g_mmobjForCrash = nullptr; // mmobj the crash injection targets (set at mmobj.init)
+static bool g_plant710465 = false; // --plant-710465: plant the drdump 710465 misaligned store and let teardown fault
 static uint8_t* s_fakeChannel;
 static void* s_fakeStateVtbl[64];
 static void* s_fakeResourceVtbl[64]; // vtable for s_fakeResource: slot 7 = StubRet1 (texture gate)
@@ -2455,8 +2456,10 @@ static HMODULE LoadSibling(const wchar_t* name, DWORD flags)
                 // question in the standalone probe too (crash object: vtable atiumd6a RVA 0x2CEB90).
                 ArmBp(h, 0x009430, "mmobj.make");   // creates [settings+0x5028]
                 ArmBp(h, 0x009482, "mmobj.init");     // post-init call: eax = init result
-                ArmBp(h, 0x037510, "crash.fn");       // crash vtable's slot+0x40: reads [obj+0x68]
-                ArmBp(h, 0x0094D0, "dtor.a6a");       // field crash path through the factory's dtor
+                if (g_plant710465) {
+                    ArmBp(h, 0x037510, "crash.fn");   // crash vtable's slot+0x40: reads [obj+0x68]
+                    ArmBp(h, 0x0094D0, "dtor.a6a");   // field crash path through the factory's dtor
+                }
             }
 #ifdef D3D9SHIM_DLL
             if (_wcsicmp(base, L"atiumd6a.dll") == 0) {
@@ -3891,6 +3894,7 @@ int wmain(int argc, wchar_t** argv)
         else if (!wcscmp(argv[i], L"--qai-index2")) g_qaiIndex2 = true;
         else if (!wcscmp(argv[i], L"--bp")) g_breakpoints = true;
         else if (!wcscmp(argv[i], L"--bp-clear")) g_bpClear = true;
+        else if (!wcscmp(argv[i], L"--plant-710465")) g_plant710465 = true;
         else if (!wcscmp(argv[i], L"--force-flush")) g_forceFlush = true;
         else if (!wcscmp(argv[i], L"--fake-draw-params")) g_fakeDrawParams = true;
         else if (!wcscmp(argv[i], L"--qai-set") && i + 1 < argc) {
@@ -4331,7 +4335,7 @@ int wmain(int argc, wchar_t** argv)
                         cr.Rotation = D3DDDI_ROTATION_IDENTITY;
                         HRESULT crhr = df->pfnCreateResource(cd.hDevice, &cr);
                         Log("  pfnCreateResource = %08lx  hResource=%p", crhr, (void*)cr.hResource);
-                        if (SUCCEEDED(crhr) && g_mmobjForCrash) {
+                        if (SUCCEEDED(crhr) && g_plant710465 && g_mmobjForCrash) {
                             // Inject the bad pointer: write an 8-byte value at obj+0x64 so the
                             // destructor at vtable+0x40 (crash.fn) reads obj+0x68 as a bad address.
                             // The real crash has a 64-bit pointer stored at +0x64 (not +0x60 or
