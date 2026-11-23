@@ -239,6 +239,11 @@ static HRESULT ShimCreateDevice(HWND hFocusWnd)
 {
     if (g_shimDevice) return S_OK;
     g_shimFocusWnd = hFocusWnd;
+    {
+        wchar_t v[4] = L"";
+        g_plant710465 = GetEnvironmentVariableW(L"MPC_PLANT_710465", v, 4) && v[0] == L'1';
+        if (g_plant710465) Log("shim: MPC_PLANT_710465=1, the drdump 710465 store will be planted after the first texture");
+    }
 
     wchar_t dll[MAX_PATH];
     DWORD n = GetEnvironmentVariableW(L"LEGACY9_DRIVER", dll, MAX_PATH);
@@ -273,6 +278,11 @@ static HRESULT ShimCreateDevice(HWND hFocusWnd)
             ArmBp(a6a_early, 0x009430, "mmobj.make");   // creates [settings+0x5028]
             ArmBp(a6a_early, 0x003710, "chan.make");    // creates [holder+0x20] (channel)
             ArmBp(a6a_early, 0x002180, "st.flush");     // atiumd6a state-flush entry
+            ArmBp(a6a_early, 0x009482, "mmobj.init");   // logs the variant's vtable, records it for the plant
+            if (g_plant710465) {
+                ArmBp(a6a_early, 0x037510, "crash.fn");
+                ArmBp(a6a_early, 0x0094D0, "dtor.a6a");
+            }
         }
     }
 
@@ -1073,6 +1083,11 @@ struct IFakeD3DDevice9Ex : IDirect3DDevice9Ex
         void* innerAtCreate = SUCCEEDED(hr) ? *(void**)((char*)cr.hResource + 0x48) : nullptr;
         Log("shim: CreateTexture(%ux%u fmt=%u) -> CreateResource = %08lx hRes=%p inner[+0x48]=%p",
             Width, Height, (UINT)Format, hr, cr.hResource, innerAtCreate);
+        if (SUCCEEDED(hr) && g_plant710465 && g_mmobjForCrash) {
+            *(uint64_t*)((uint8_t*)g_mmobjForCrash + 0x64) = 0x00000001DEADBEEFULL;
+            Log("shim: injected bad pointer at obj+0x64: obj=%p", g_mmobjForCrash);
+            g_mmobjForCrash = nullptr;
+        }
         // Diagnostic (first few resources only): dump every non-null qword in the first
         // 0x100 bytes of the driver's resource object, so the offsets the deep flush
         // follows ([hRes+0x10] backing, [hRes+0x48] inner) are visible at creation time.
